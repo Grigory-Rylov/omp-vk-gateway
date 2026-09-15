@@ -1,0 +1,15 @@
+# configs with tokens
+config.json
+ref-config.json
+
+# logs
+debug/
+*.log
+*.out
+
+# attachments
+attachments/
+
+# build artifacts (build.sh)
+/omp-agent
+/omp-agent-restarter
