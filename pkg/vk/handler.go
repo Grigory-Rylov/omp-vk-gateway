@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"omp-vk-gateway/pkg/gpu"
 	"omp-vk-gateway/pkg/logger"
 )
 
@@ -347,7 +348,7 @@ func (h *BotHandler) handleCommand(input string, peerID int64) string {
 		return "Доступные команды:\n" +
 			"/clear — Очистить историю диалога (рабочая директория сохраняется)\n" +
 			"/newsession [path] (/n) — Сбросить сессию и сменить рабочую директорию\n" +
-			"/status — Статус агента: модель, сессия, контекст\n" +
+			"/status — Статус агента: модель, сессия, контекст, GPU (если есть nvidia-smi)\n" +
 			"/log — Отправить файлы из папки debug/\n" +
 			"/m, /models — Список доступных моделей\n" +
 			"/r [provider/model] — Переключить текущую модель\n" +
@@ -454,9 +455,32 @@ func (h *BotHandler) handleStatus(peerID int64) string {
 	h.backend.EnsureSession(peerID)
 	status, err := h.backend.Status(ctx, peerID)
 	if err != nil {
-		return fmt.Sprintf("❌ Ошибка получения статуса: %v", err)
+		status = fmt.Sprintf("❌ Ошибка получения статуса: %v", err)
+	}
+	if gpuBlock := h.statusGPU(); gpuBlock != "" {
+		status += "\n" + gpuBlock
 	}
 	return status
+}
+
+// statusGPU returns the nvidia-smi status block, or "" when the host has no
+// usable nvidia-smi (or the query fails): /status then shows nothing extra.
+func (h *BotHandler) statusGPU() string {
+	if !gpu.Available() {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	info, err := gpu.Fetch(ctx)
+	if err != nil {
+		if h.log != nil {
+			h.log.DebugLogf("GPU status unavailable: %v", err)
+		}
+		return ""
+	}
+	return gpu.Format(info)
 }
 
 func (h *BotHandler) handleModelsList(peerID int64) string {
