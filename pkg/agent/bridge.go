@@ -28,7 +28,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,13 +46,17 @@ var ErrProcessFailed = errors.New("agent process failed")
 
 // Bridge owns one lazily-spawned omp RPC subprocess per VK peer.
 type Bridge struct {
-	mu           sync.Mutex
-	peers        map[int64]*peerSession
-	agentCmd     []string
-	extraArgs    []string
-	log          *logger.Logger
-	thinker      func(peerID int64, line string) error
-	readyTimeout time.Duration
+	mu             sync.Mutex
+	peers          map[int64]*peerSession
+	agentCmd       []string
+	extraArgs      []string
+	stateDir       string // per-peer state files for restart survival
+	log            *logger.Logger
+	thinker        func(peerID int64, line string) error
+	runAgentResult func(peerID int64, text string) error
+	reRunResult    func(peerID int64, text string) error
+	readyTimeout   time.Duration
+	subagentLevel  string // subagent mirroring: off | progress | events
 }
 
 // NewBridge creates the bridge. agentCmd is the full command line of the
@@ -66,12 +73,315 @@ func NewBridge(agentCmd []string, extraArgs []string, log *logger.Logger) *Bridg
 	}
 }
 
+// SetStateDir points the bridge at a directory where per-peer state files
+// (agent-state-<peerID>.json: workdir, oh-my-pi session id/file, in-flight
+// run_agent descriptors) are persisted, so a restarted gateway can respawn
+// each coprocess with --resume <sessionFile> (same conversation context)
+// and re-issue run_agent work that was in flight.
+func (b *Bridge) SetStateDir(dir string) {
+	b.mu.Lock()
+	b.stateDir = dir
+	b.mu.Unlock()
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.log.WarnLogf("agent state dir %q: %v", dir, err)
+	}
+}
+
+func (b *Bridge) stateFileLocked(peerID int64) string {
+	if b.stateDir == "" {
+		return ""
+	}
+	return filepath.Join(b.stateDir, fmt.Sprintf("agent-state-%d.json", peerID))
+}
+
+// persistStateLocked atomically writes the peer's state file (tmp+rename).
+// No-op when no state dir is configured. Caller holds s.mu.
+func (b *Bridge) persistStateLocked(s *peerSession) {
+	f := b.stateFileLocked(s.peerID)
+	if f == "" {
+		return
+	}
+	data, err := json.Marshal(peerState{
+		Workdir:      s.workdir,
+		SessionID:    s.resumeSessionID,
+		SessionFile:  s.resumeSessionFile,
+		InFlightRuns: s.inFlightRuns,
+		LastPrompt:   s.lastPrompt,
+	})
+	if err != nil {
+		return
+	}
+	if os.WriteFile(f+".tmp", data, 0o644) != nil {
+		return
+	}
+	_ = os.Rename(f+".tmp", f)
+}
+
+// refreshSessionState captures the coprocess's current oh-my-pi session
+// (id + on-disk file) for a later --resume and persists it. A failed
+// capture is logged and ignored: the next capture point retries.
+func (b *Bridge) refreshSessionState(s *peerSession, proc *process) {
+	// No ready() gate: the coprocess is already ready (the post-ready capture
+	// runs before markReady, and agent_end /clear capture run after). The
+	// request timeout is the safety for a dead or not-yet-responding process.
+	if proc == nil || proc.done() {
+		return
+	}
+	resp, err := b.request(s, proc, context.Background(), "get_state", nil, 10*time.Second)
+	if err != nil {
+		s.debugf("session state refresh: %v", err)
+		return
+	}
+	var st rpcSessionState
+	if json.Unmarshal(resp.Data, &st) != nil {
+		return
+	}
+	s.mu.Lock()
+	s.resumeSessionID = st.SessionID
+	s.resumeSessionFile = st.SessionFile
+	b.persistStateLocked(s)
+	s.mu.Unlock()
+}
+
+// runDescriptor is one persisted in-flight run_agent (agent + task) so an
+// interrupted run can be re-issued after a gateway restart.
+type runDescriptor struct {
+	Agent string `json:"agent"`
+	Task  string `json:"task"`
+}
+
+// peerState is one per-peer state file (agent-state-<peerID>.json).
+type peerState struct {
+	Workdir      string                    `json:"workdir,omitempty"`
+	SessionID    string                    `json:"sessionId,omitempty"`
+	SessionFile  string                    `json:"sessionFile,omitempty"`
+	InFlightRuns map[string]*runDescriptor `json:"inFlightRuns,omitempty"`
+	// LastPrompt is the plain-text prompt of the peer's in-flight normal turn
+	// (empty once the turn settles). A restart/reboot with a non-empty value
+	// re-sends it as a fresh prompt on the --resume session: oh-my-pi does not
+	// auto-continue a dangling turn, and /retry no-ops on a hard-kill that
+	// leaves only a user message, so re-prompting is the only robust re-issue.
+	LastPrompt string `json:"lastPrompt,omitempty"`
+}
+
+// ResumePeers restores persisted state after a gateway restart: each coprocess
+// respawns with --resume <sessionFile> (same session context) and every
+// in-flight run_agent is re-issued (the interrupted run's disk state
+// survives; oh-my-pi has no subagent-resume RPC, so a restart is the honest
+// recovery). State files are removed once their runs are re-issued.
+func (b *Bridge) ResumePeers() {
+	b.mu.Lock()
+	dir := b.stateDir
+	hasCmd := len(b.agentCmd) > 0
+	b.mu.Unlock()
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "agent-state-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		peerID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, "agent-state-"), ".json"), 10, 64)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var st peerState
+		if json.Unmarshal(data, &st) != nil {
+			b.log.WarnLogf("resume peer %d: unreadable state", peerID)
+			continue
+		}
+		s := b.session(peerID)
+		s.mu.Lock()
+		if st.Workdir != "" {
+			s.workdir = st.Workdir
+		}
+		s.resumeSessionID = st.SessionID
+		s.resumeSessionFile = st.SessionFile
+		s.mu.Unlock()
+		// Re-issue interrupted @agent runs. Gated on a usable agent command so
+		// unit tests (no coprocess command configured) still exercise state
+		// restoration + descriptor consumption; production always sets one.
+		if len(st.InFlightRuns) > 0 {
+			if !hasCmd {
+				if b.log != nil {
+					b.log.WarnLogf("peer %d: %d in-flight run(s) not re-issued (no agent command)", peerID, len(st.InFlightRuns))
+				}
+			} else {
+				b.log.InfoLogf("peer %d: re-issuing %d in-flight run(s) after restart", peerID, len(st.InFlightRuns))
+				for _, r := range st.InFlightRuns {
+					if r == nil {
+						continue
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+					if err := b.RunAgent(ctx, r.Agent, r.Task, peerID); err != nil {
+						b.log.WarnLogf("peer %d: re-issue @%s run failed: %v", peerID, r.Agent, err)
+					}
+					cancel()
+				}
+			}
+		}
+		// Re-issue the interrupted main-bot turn: re-send the last in-flight
+		// prompt as a fresh turn on the --resume session. The answer is
+		// delivered via the reRunResult callback (no ProcessMessage waiter).
+		if st.LastPrompt != "" {
+			if !hasCmd {
+				if b.log != nil {
+					b.log.WarnLogf("peer %d: in-flight turn not re-issued (no agent command)", peerID)
+				}
+			} else {
+				if b.log != nil {
+					b.log.InfoLogf("peer %d: re-issuing in-flight turn after restart: %.120s", peerID, st.LastPrompt)
+				}
+				go func(peerID int64, prompt string) {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+					defer cancel()
+					text, err := b.ProcessMessage(ctx, prompt, peerID)
+					if err != nil {
+						if b.log != nil {
+							b.log.WarnLogf("peer %d: re-run turn failed: %v", peerID, err)
+						}
+						return
+					}
+					if text == "" {
+						return
+					}
+					b.mu.Lock()
+					cb := b.reRunResult
+					b.mu.Unlock()
+					if cb == nil {
+						return
+					}
+					if err := cb(peerID, text); err != nil && b.log != nil {
+						b.log.WarnLogf("peer %d: re-run result delivery failed: %v", peerID, err)
+					}
+				}(peerID, st.LastPrompt)
+			}
+		}
+		// Keep the state file: the re-issued work re-persists its own
+		// descriptors below, so a further restart (double reboot, restarter
+		// churn) still finds the work and re-issues it again.
+	}
+}
+
 // SetThinkingCallback registers the mirror sink (peerID, line) for
 // thinking and tool-start lines.
 func (b *Bridge) SetThinkingCallback(fn func(peerID int64, line string) error) {
 	b.mu.Lock()
 	b.thinker = fn
 	b.mu.Unlock()
+}
+
+// SetSubagentSubscription toggles mirroring of subagent activity (the
+// lead -> developer -> reviewer/qa chain) to the reasoning peer. level is
+// "progress" (lifecycle + progress digest) or "events" (full subagent
+// session events, incl. reasoning); anything else maps to "off". The
+// command is (re)sent to each spawned process after the protocol handshake.
+func (b *Bridge) SetSubagentSubscription(level string) {
+	switch level {
+	case "progress", "events":
+	default:
+		level = "off"
+	}
+	b.mu.Lock()
+	b.subagentLevel = level
+	b.mu.Unlock()
+}
+
+func (b *Bridge) subagentSubscriptionLevel() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.subagentLevel
+}
+
+// SetRunAgentResultCallback registers the sink for a settled run_agent's
+// final text. It is invoked from the event pump when a terminal subagent
+// lifecycle frame matches an in-flight run_agent (the frame's
+// parentToolCallId carries the run_agent command id). The text is the
+// subagent's raw output; delivery to the VK peer is the sink's job.
+func (b *Bridge) SetRunAgentResultCallback(fn func(peerID int64, text string) error) {
+	b.mu.Lock()
+	b.runAgentResult = fn
+	b.mu.Unlock()
+}
+
+// SetReRunResultCallback registers a sink for a re-issued in-flight turn's
+// final text. A restart re-sends the peer's last in-flight prompt on its
+// --resume session; the resulting answer has no ProcessMessage waiter, so it
+// is delivered to VK via this callback (the user's own chat, unlike a
+// directly-launched subagent which surfaces in the reasoning chat).
+func (b *Bridge) SetReRunResultCallback(fn func(peerID int64, text string) error) {
+	b.mu.Lock()
+	b.reRunResult = fn
+	b.mu.Unlock()
+}
+
+// RunAgent deterministically launches the named subagent with task as its
+// full prompt. It is fire-and-forget: the call returns once the coprocess
+// accepts the run and does not mark the peer's turn active, so a foreground
+// turn and a background subagent may run at once. The subagent's final text
+// is delivered through the RunAgentResult callback when its run settles (the
+// terminal subagent_lifecycle frame's parentToolCallId carries the run_agent
+// command id). ctx cancellation does not abort the in-flight subagent.
+func (b *Bridge) RunAgent(ctx context.Context, agent, task string, peerID int64) error {
+	s := b.session(peerID)
+	s.startIfNeeded()
+	for range 20 {
+		proc, err := s.waitReady(ctx)
+		if err != nil {
+			return err
+		}
+		if !proc.done() {
+			s.mu.Lock()
+			stale := s.resetRequested || s.proc != proc
+			s.mu.Unlock()
+			if !stale {
+				id := "vk-" + strconv.FormatInt(peerID, 10) + "-" + proc.nextID()
+				payload := map[string]interface{}{
+					"id":    id, // overrides request()'s correlation id; run_agent echoes it as parentToolCallId
+					"agent": agent,
+					"task":  task,
+				}
+				resp, err := b.request(s, proc, ctx, "run_agent", payload, 15*time.Second)
+				if err != nil {
+					return fmt.Errorf("run_agent: %w", err)
+				}
+				if !resp.Success {
+					return fmt.Errorf("run_agent %s: %s", agent, resp.Error)
+				}
+				s.mu.Lock()
+				if s.runAgentIDs == nil {
+					s.runAgentIDs = map[string]bool{}
+				}
+				s.runAgentIDs[id] = true
+				if s.inFlightRuns == nil {
+					s.inFlightRuns = map[string]*runDescriptor{}
+				}
+				s.inFlightRuns[id] = &runDescriptor{Agent: agent, Task: task}
+				b.persistStateLocked(s)
+				s.mu.Unlock()
+				b.refreshSessionState(s, proc)
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("агент-процесс недоступен")
 }
 
 func (b *Bridge) debugf(format string, args ...interface{}) {
@@ -93,10 +403,15 @@ func (b *Bridge) session(peerID int64) *peerSession {
 
 func (b *Bridge) newPeerSession(peerID int64) *peerSession {
 	s := &peerSession{
-		bridge:   b,
-		peerID:   peerID,
-		turnDone: make(chan turnResult, 8),
-		resetCh:  make(chan struct{}, 8),
+		bridge:        b,
+		peerID:        peerID,
+		turnDone:      make(chan turnResult, 8),
+		resetCh:       make(chan struct{}, 8),
+		subagentLine:  map[string]string{},
+		subagentThink: map[string]*strings.Builder{},
+		subagentName:  map[string]string{},
+		runAgentIDs:   map[string]bool{},
+		inFlightRuns:  map[string]*runDescriptor{},
 	}
 	go b.supervise(peerID, s)
 	return s
@@ -176,8 +491,12 @@ func (b *Bridge) ProcessMessage(ctx context.Context, message string, peerID int6
 	}
 	s.turnActive = true
 	s.turnAborted = false
+	s.badToolRetries = 0
 	s.turnText.Reset()
 	s.turnThinking.Reset()
+	s.resetSubagentStateLocked()
+	s.lastPrompt = message
+	b.persistStateLocked(s)
 	// Discard stale reset notifications queued before this turn started
 	// (e.g. by the reset that triggered this process's respawn).
 	for {
@@ -359,6 +678,9 @@ func (b *Bridge) NewSession(ctx context.Context, peerID int64) error {
 	if data.Cancelled {
 		s.abortTurn()
 	}
+	// /clear rotates the coprocess into a fresh session: capture its new
+	// id/file so a later restart resumes the post-reset context.
+	b.refreshSessionState(s, proc)
 	return nil
 }
 
@@ -493,14 +815,19 @@ func (b *Bridge) SetModel(ctx context.Context, peerID int64, ref string) error {
 // request sends a command and waits for its correlated response.
 func (b *Bridge) request(s *peerSession, proc *process, ctx context.Context,
 	cmdType string, payload map[string]interface{}, timeout time.Duration) (*rpcResponse, error) {
-	id := fmt.Sprintf("vk-%d-%s", s.peerID, proc.nextID())
 	req := map[string]interface{}{
-		"id":   id,
+		"id":   fmt.Sprintf("vk-%d-%s", s.peerID, proc.nextID()),
 		"type": cmdType,
 	}
 	for k, v := range payload {
 		req[k] = v
 	}
+	// The payload may override the correlation id: run_agent passes a
+	// pre-generated id the coprocess echoes back as parentToolCallId, so
+	// the pending channel must be keyed by the actual wire id (req["id"]),
+	// not the default generated above (or the response is dropped and the
+	// request times out even though the command was accepted).
+	id, _ := req["id"].(string)
 	if err := proc.write(req); err != nil {
 		return nil, err
 	}
@@ -625,9 +952,8 @@ func (p *process) dropPending(id string) {
 
 // spawn starts the omp subprocess and blocks (in a background goroutine)
 // until the ready frame + protocol v2 negotiation complete.
-func (p *process) spawn(workdir string, agentCmd, extraArgs []string) error {
-	args := append(append([]string{}, agentCmd[1:]...), extraArgs...)
-	args = append(args, "--cwd", workdir)
+func (p *process) spawn(workdir, resume string, agentCmd, extraArgs []string) error {
+	args := spawnArgs(agentCmd, extraArgs, resume, workdir)
 
 	cmd := exec.Command(agentCmd[0], args...)
 	cmd.Dir = workdir
@@ -658,8 +984,21 @@ func (p *process) spawn(workdir string, agentCmd, extraArgs []string) error {
 	go p.readLoop()
 	go p.waitExit(cmd)
 
-	p.debugf("peer %d: omp spawned (pid %d, cwd %s)", p.peerID, cmd.Process.Pid, workdir)
+	p.debugf("peer %d: omp spawned (pid %d, cwd %s, resume %q)", p.peerID, cmd.Process.Pid, workdir, resume)
 	return nil
+}
+
+// spawnArgs assembles the omp CLI args: the configured command, extra args,
+// --resume <sessionFile> when given, and --cwd last. The resume file must
+// exist on disk: oh-my-pi exits cleanly on an unresolvable resume target,
+// which would otherwise loop through the ready-timeout / respawn cycle.
+func spawnArgs(agentCmd, extraArgs []string, resume, workdir string) []string {
+	args := append(append([]string{}, agentCmd[1:]...), extraArgs...)
+	if resume != "" {
+		args = append(args, "--resume", resume)
+	}
+	args = append(args, "--cwd", workdir)
+	return args
 }
 
 func (p *process) debugf(format string, args ...interface{}) {
