@@ -42,6 +42,11 @@ type AgentBackend interface {
 	// ctx cancellation aborts the turn; ErrSessionReset is returned when the
 	// session was reset underneath the turn.
 	ProcessMessage(ctx context.Context, message string, peerID int64) (string, error)
+	// RunAgent deterministically launches the named subagent with task as its
+	// full prompt (no LLM routing). It is asynchronous: the call returns once
+	// the coprocess accepts the run, and the subagent's final text arrives via
+	// SetRunAgentResultCallback when the run settles.
+	RunAgent(ctx context.Context, agent, task string, peerID int64) error
 	// NewSession resets the in-flight session in place (working dir preserved).
 	NewSession(ctx context.Context, peerID int64) error
 	// ResetSession stops the agent and respawns it in the given workdir.
@@ -64,6 +69,9 @@ type AgentBackend interface {
 	WorkingDir(peerID int64) string
 	// SetThinkingCallback registers a sink for mirrored thinking/tool lines.
 	SetThinkingCallback(fn func(peerID int64, line string) error)
+	// SetRunAgentResultCallback registers a sink for a settled run_agent's
+	// final text, delivered to the VK peer that started the run.
+	SetRunAgentResultCallback(fn func(peerID int64, text string) error)
 	// CloseAll stops every agent subprocess.
 	CloseAll()
 }
@@ -100,6 +108,7 @@ type BotHandler struct {
 	thinkingPeerID int64
 	defaultWorkdir string
 	attachmentsDir string
+	agentNames     map[string]bool
 
 	cancelFuncs      map[int64]*cancelEntry
 	resumeOwners     map[int64]bool
@@ -133,6 +142,7 @@ func NewBotHandler(vkClient *BotClient, backend AgentBackend, log *logger.Logger
 		thinkingPeerID:    thinkingPeerID,
 		defaultWorkdir:    defaultWorkdir,
 		attachmentsDir:    "./attachments",
+		agentNames:        defaultAgentNames(),
 		cancelFuncs:       make(map[int64]*cancelEntry),
 		resumeOwners:      make(map[int64]bool),
 		peerProcessors:    make(map[int64]*sync.Mutex),
@@ -157,7 +167,21 @@ func (h *BotHandler) SetRestartSignalFile(name string) {
 func (h *BotHandler) ProcessMessage(message string, peerID int64) string {
 	h.backend.EnsureSession(peerID)
 
+	message = h.normalizeAgentMentions(message)
+
 	command := extractCommand(message)
+
+	if agent, task, ok := parseRunAgentDispatch(command); ok && h.agentNames[agent] {
+		if task == "" {
+			return "\u0417\u0430\u0434\u0430\u0439 \u0437\u0430\u0434\u0430\u0447\u0443: @" + agent + " <\u0437\u0430\u0434\u0430\u0447\u0430> \u2014 \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442 \u044d\u0442\u043e\u0433\u043e \u0441\u0430\u0431\u0430\u0433\u0435\u043d\u0442\u0430 \u043d\u0430\u043f\u0440\u044f\u043c\u0443\u044e."
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := h.backend.RunAgent(ctx, agent, task, peerID); err != nil {
+			return "\u274c \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c " + agent + ": " + err.Error()
+		}
+		return "\U0001f916 \u0417\u0430\u043f\u0443\u0441\u043a\u0430\u044e " + agent + "\u2026 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u043f\u0440\u0438\u0434\u0451\u0442 \u0432 reasoning-\u0447\u0430\u0442."
+	}
 
 	if strings.HasPrefix(command, "/") {
 		result := h.handleCommand(command, peerID)
@@ -869,6 +893,7 @@ func (h *BotHandler) launchMessageHandler(
 			h.handleIncomingMessage(msg, replyPeerID, fullMsgMap)
 		default:
 			text := strings.TrimSpace(msg.Text)
+			text = h.normalizeAgentMentions(text)
 			if msg.EventID == "" && text != "" && !strings.HasPrefix(text, "/") {
 				if h.backend.IsStreaming(msg.PeerID) {
 					logger.DebugToFile("[handler] semaphore saturated: admitting text from peer %d as steer", msg.PeerID)

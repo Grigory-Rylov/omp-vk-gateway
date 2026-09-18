@@ -35,6 +35,44 @@ type peerSession struct {
 	resetCh        chan struct{}
 	resetRequested bool
 	closed         bool
+	// badToolRetries counts consecutive terminal completions of the current
+	// turn whose final text looked like a leaked tool-call attempt; reset on
+	// every fresh turn and on any clean completion.
+	badToolRetries int
+	// subagentLine dedupes mirrored subagent progress lines per subagent
+	// (key = subagent id, else agent#index); subagentThink buffers the
+	// reasoning deltas of a subagent assistant message (events level) so they
+	// flush as one line on message_end; subagentName maps subagent id ->
+	// agent name for display prefixes. All reset per turn.
+	subagentLine  map[string]string
+	subagentThink map[string]*strings.Builder
+	subagentName  map[string]string
+	// resumeSessionID/File is the oh-my-pi session the coprocess holds
+	// (captured via get_state): a respawn passes --resume <sessionFile> so
+	// the conversation context survives gateway restarts and host reboots.
+	resumeSessionID   string
+	resumeSessionFile string
+	// inFlightRuns persists run_agent descriptors (wire id -> descriptor)
+	// so interrupted work can be re-issued after a gateway restart; cleared
+	// on each run's terminal frame.
+	inFlightRuns map[string]*runDescriptor
+	// runAgentIDs tracks in-flight run_agent command ids (the coprocess
+	// echoes each as parentToolCallId on the subagent's terminal lifecycle
+	// frame). It is deliberately NOT reset by resetSubagentStateLocked: a
+	// subagent outlives the peer's turns, so a fresh turn must not drop a
+	// still-running run_agent.
+	runAgentIDs map[string]bool
+	// lastPrompt is the plain-text prompt of the in-flight normal turn (set
+	// when the turn starts, cleared when it settles or the session is reset).
+	// Persisted so a restart/reboot re-sends it on the --resume session.
+	lastPrompt string
+}
+
+// resetSubagentState clears all per-subagent mirror state. Caller holds s.mu.
+func (s *peerSession) resetSubagentStateLocked() {
+	s.subagentLine = map[string]string{}
+	s.subagentThink = map[string]*strings.Builder{}
+	s.subagentName = map[string]string{}
 }
 
 func (s *peerSession) debugf(format string, args ...interface{}) {
@@ -66,8 +104,21 @@ func (s *peerSession) startProcessLocked() {
 	b := s.bridge
 	proc := newProcess(s.peerID, b.log)
 	s.proc = proc
+	// Resume the previous oh-my-pi session when its file still exists on
+	// disk; otherwise fall back to a fresh session and drop the stale
+	// resume values (oh-my-pi exits cleanly on a missing resume target,
+	// which would otherwise loop through the ready-timeout / respawn cycle).
+	resume := s.resumeSessionFile
+	if resume != "" {
+		if _, err := os.Stat(resume); err != nil {
+			s.resumeSessionID = ""
+			s.resumeSessionFile = ""
+			b.persistStateLocked(s)
+			resume = ""
+		}
+	}
 	go func() {
-		if err := proc.spawn(wd, b.agentCmd, b.extraArgs); err != nil {
+		if err := proc.spawn(wd, resume, b.agentCmd, b.extraArgs); err != nil {
 			s.debugf("spawn failed: %v", err)
 			if b.log != nil {
 				b.log.ErrorLogf("peer %d: spawn failed: %v", s.peerID, err)
@@ -158,6 +209,17 @@ func (b *Bridge) supervise(peerID int64, s *peerSession) {
 				s.mu.Unlock()
 				return
 			}
+			// An explicit /clear or /newsession is a fresh start: drop the
+			// persisted resume target and in-flight runs so the respawn opens
+			// a clean session. Crash respawns (resetReq false) keep the
+			// session for --resume.
+			s.resumeSessionID = ""
+			s.resumeSessionFile = ""
+			s.lastPrompt = ""
+			for id := range s.inFlightRuns {
+				delete(s.inFlightRuns, id)
+			}
+			b.persistStateLocked(s)
 			s.startProcessLocked()
 			s.notifyResetLocked()
 			s.mu.Unlock()
@@ -257,6 +319,14 @@ func (s *peerSession) deliverTurnLocked(res turnResult) {
 		return
 	}
 	s.turnActive = false
+	// The turn has settled: the in-flight prompt is no longer pending, so
+	// clear it (a restart now must not re-issue a completed turn). This is
+	// the single choke point every settle path (agent_end / abort / reset)
+	// funnels through.
+	if s.lastPrompt != "" {
+		s.lastPrompt = ""
+		s.bridge.persistStateLocked(s)
+	}
 	select {
 	case s.turnDone <- res:
 	default:
@@ -328,6 +398,12 @@ func (b *Bridge) handleEvent(s *peerSession, proc *process, line string) {
 		b.handleAgentEnd(s, frame)
 	case "extension_ui_request":
 		b.handleExtensionUI(s, frame)
+	case "subagent_lifecycle":
+		b.handleSubagentLifecycle(s, frame)
+	case "subagent_progress":
+		b.handleSubagentProgress(s, frame)
+	case "subagent_event":
+		b.handleSubagentEvent(s, frame)
 	}
 }
 
@@ -526,11 +602,60 @@ func (b *Bridge) handleAgentEnd(s *peerSession, frame map[string]interface{}) {
 	thinking := s.turnThinking.String()
 	s.turnText.Reset()
 	s.turnThinking.Reset()
+
+	if !aborted && looksLikeBadToolCall(text) && s.badToolRetries < maxBadToolRetries {
+		// The model emitted a tool-call attempt as plain text: nothing was
+		// executed, so the agent ended its turn on that message. Hide the
+		// raw attempt from the chat, log it, and ask the model to retry —
+		// the turn stays active so the continuation's terminal agent_end
+		// re-enters this path (budget capped by maxBadToolRetries).
+		s.badToolRetries++
+		attempt := s.badToolRetries
+		proc := s.proc
+		s.mu.Unlock()
+		if b.log != nil {
+			b.log.WarnLogf("peer %d: hiding malformed tool-call attempt %d/%d: %.300s", s.peerID, attempt, maxBadToolRetries, text)
+		}
+		s.debugf("agent_end (terminal) = leaked tool call, nudge %d/%d", attempt, maxBadToolRetries)
+		go b.retryBadToolCall(s, proc)
+		return
+	}
+	s.badToolRetries = 0
 	s.debugf("agent_end (terminal), %d chars, aborted=%v", len(text), aborted)
+	s.resetSubagentStateLocked()
 	s.deliverTurnLocked(turnResult{text: text, aborted: aborted})
 	s.mu.Unlock()
 	if thinking != "" {
 		b.mirrorLine(s, "💭 "+strings.TrimSpace(thinking))
+	}
+	// Turn settled: re-capture the session id/file (it can rotate between
+	// turns) and persist for a later --resume.
+	b.refreshSessionState(s, s.proc)
+}
+
+// retryBadToolCall asks the model to retry a turn that terminated on a
+// leaked tool-call attempt. If the prompt cannot be delivered (process dead
+// or reset underneath), the turn finalizes as aborted so its waiter does
+// not hang.
+func (b *Bridge) retryBadToolCall(s *peerSession, proc *process) {
+	if proc == nil || proc.done() {
+		s.debugf("bad-tool retry skipped, process gone")
+		s.mu.Lock()
+		if s.turnActive {
+			s.turnAborted = true
+			s.deliverTurnLocked(turnResult{aborted: true})
+		}
+		s.mu.Unlock()
+		return
+	}
+	if err := b.prompt(s, proc, nudgeBadToolCall); err != nil {
+		s.debugf("bad-tool retry prompt failed: %v", err)
+		s.mu.Lock()
+		if s.turnActive {
+			s.turnAborted = true
+			s.deliverTurnLocked(turnResult{aborted: true})
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -631,6 +756,15 @@ func (b *Bridge) negotiate(s *peerSession, proc *process, readyLine string) {
 			s.debugf("protocol v2 negotiated")
 		}
 	}
+	// Capture the session id/file right after the ready handshake, so even a
+	// gateway killed before the first turn can later resume this coprocess.
+	b.refreshSessionState(s, proc)
+	if level := b.subagentSubscriptionLevel(); level != "off" {
+		if _, err := b.request(s, proc, context.Background(), "set_subagent_subscription",
+			map[string]interface{}{"level": level}, 15*time.Second); err != nil {
+			s.debugf("set_subagent_subscription: %v", err)
+		}
+	}
 	proc.markReady(nil)
 }
 
@@ -641,6 +775,233 @@ func containsInt(list []int, v int) bool {
 		}
 	}
 	return false
+}
+
+// subagentKey identifies a subagent across lifecycle/progress/event frames:
+// the subagent id when present, else agent#index.
+func subagentKey(id, agent string, index int) string {
+	if id != "" {
+		return id
+	}
+	if agent != "" {
+		return fmt.Sprintf("%s#%d", agent, index)
+	}
+	return "subagent"
+}
+
+// truncateLine trims s to at most n runes, appending an ellipsis when cut.
+func truncateLine(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\u2026"
+}
+
+// handleSubagentLifecycle mirrors a subagent start/finish line to the
+// reasoning peer.
+func (b *Bridge) handleSubagentLifecycle(s *peerSession, frame map[string]interface{}) {
+	pl, _ := frame["payload"].(map[string]interface{})
+	if pl == nil {
+		return
+	}
+	id := strOf(pl["id"])
+	agent := strOf(pl["agent"])
+	index := intOf(pl["index"])
+	key := subagentKey(id, agent, index)
+	status := strOf(pl["status"])
+	s.mu.Lock()
+	s.subagentName[key] = agent
+	switch status {
+	case "started":
+		if sb, ok := s.subagentThink[key]; ok {
+			sb.Reset()
+		}
+	case "completed", "failed", "aborted":
+		delete(s.subagentLine, key)
+		delete(s.subagentThink, key)
+	}
+	s.mu.Unlock()
+	var line string
+	switch status {
+	case "started":
+		if desc := strOf(pl["description"]); desc != "" {
+			line = fmt.Sprintf("\U0001F916 \u0441\u0443\u0431\u0430\u0433\u0435\u043d\u0442 %s [#%d] \u0437\u0430\u043f\u0443\u0449\u0435\u043d: %s", agent, index, truncateLine(desc, 200))
+		} else {
+			line = fmt.Sprintf("\U0001F916 \u0441\u0443\u0431\u0430\u0433\u0435\u043d\u0442 %s [#%d] \u0437\u0430\u043f\u0443\u0449\u0435\u043d", agent, index)
+		}
+	case "completed":
+		line = fmt.Sprintf("\U0001F916 \u0441\u0443\u0431\u0430\u0433\u0435\u043d\u0442 %s [#%d] \u0437\u0430\u0432\u0435\u0440\u0448\u0451\u043d", agent, index)
+	case "failed":
+		line = fmt.Sprintf("\U0001F916 \u0441\u0443\u0431\u0430\u0433\u0435\u043d\u0442 %s [#%d] \u043e\u0448\u0438\u0431\u043a\u0430", agent, index)
+	case "aborted":
+		line = fmt.Sprintf("\U0001F916 \u0441\u0443\u0431\u0430\u0433\u0435\u043d\u0442 %s [#%d] \u043f\u0440\u0435\u0440\u0432\u0430\u043d", agent, index)
+	default:
+		return
+	}
+	b.mirrorLine(s, line)
+
+	// run_agent side-channel: a terminal frame whose parentToolCallId matches
+	// an in-flight run_agent delivers the subagent's final text to the VK peer
+	// that launched it (separate from the reasoning mirror above, which still
+	// fires so the reasoning peer shows the subagent activity).
+	ptcid := strOf(pl["parentToolCallId"])
+	if ptcid != "" {
+		s.mu.Lock()
+		inFlight := s.runAgentIDs[ptcid]
+		// Consume the id only on a terminal frame: the started frame of the
+		// same run also carries parentToolCallId and must not claim it.
+		if inFlight && status != "started" {
+			delete(s.runAgentIDs, ptcid)
+			if r := s.inFlightRuns[ptcid]; r != nil {
+				delete(s.inFlightRuns, ptcid)
+				b.persistStateLocked(s)
+			}
+		}
+		s.mu.Unlock()
+		if inFlight && status != "started" {
+			text := strOf(pl["output"])
+			if status == "failed" {
+				text = "\u26a0\ufe0f " + agent + " \u043e\u0448\u0438\u0431\u043a\u0430" + "\n" + text
+			} else if status == "aborted" {
+				text = "\u26a0\ufe0f " + agent + " \u043f\u0440\u0435\u0440\u0432\u0430\u043d"
+			}
+			b.mu.Lock()
+			cb := b.runAgentResult
+			b.mu.Unlock()
+			if cb != nil {
+				if err := cb(s.peerID, text); err != nil {
+					s.debugf("run_agent deliver failed: %v", err)
+				}
+			}
+		}
+	}
+}
+
+// handleSubagentProgress mirrors a subagent progress line, deduped so only a
+// changed gist reaches the reasoning peer (the upstream progress feed is
+// coalesced to ~6/s per subagent and would trip VK flood control otherwise).
+func (b *Bridge) handleSubagentProgress(s *peerSession, frame map[string]interface{}) {
+	pl, _ := frame["payload"].(map[string]interface{})
+	if pl == nil {
+		return
+	}
+	agent := strOf(pl["agent"])
+	index := intOf(pl["index"])
+	id := ""
+	gist := "\u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442\u0441\u044f"
+	if pg, ok := pl["progress"].(map[string]interface{}); ok {
+		id = strOf(pg["id"])
+		if a := strOf(pg["agent"]); a != "" {
+			agent = a
+		}
+		if i := intOf(pg["index"]); i != 0 {
+			index = i
+		}
+		if li := strOf(pg["lastIntent"]); li != "" {
+			gist = li
+		} else if ct := strOf(pg["currentTool"]); ct != "" {
+			gist = "\u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442 " + ct
+		}
+	}
+	key := subagentKey(id, agent, index)
+	line := fmt.Sprintf("\u23F3 %s: %s", agent, truncateLine(gist, 200))
+	s.mu.Lock()
+	if s.subagentName[key] == "" {
+		s.subagentName[key] = agent
+	}
+	if s.subagentLine[key] == line {
+		s.mu.Unlock()
+		return
+	}
+	s.subagentLine[key] = line
+	s.mu.Unlock()
+	b.mirrorLine(s, line)
+}
+
+// handleSubagentEvent mirrors subagent session events (reasoning + tool
+// starts) to the reasoning peer. Reasoning deltas are buffered per subagent
+// assistant message and flushed as one line on message_end (per-token sends
+// trip VK flood control).
+func (b *Bridge) handleSubagentEvent(s *peerSession, frame map[string]interface{}) {
+	pl, _ := frame["payload"].(map[string]interface{})
+	if pl == nil {
+		return
+	}
+	id := strOf(pl["id"])
+	ev, _ := pl["event"].(map[string]interface{})
+	if ev == nil {
+		return
+	}
+	switch strOf(ev["type"]) {
+	case "tool_execution_start":
+		line := toolStartLine(map[string]interface{}{"toolName": ev["toolName"], "args": ev["args"]})
+		if line == "" {
+			return
+		}
+		s.mu.Lock()
+		name := s.subagentName[id]
+		s.mu.Unlock()
+		if name == "" {
+			name = id
+		}
+		b.mirrorLine(s, fmt.Sprintf("\U0001F916 %s: %s", name, line))
+	case "message_start":
+		msg, _ := ev["message"].(map[string]interface{})
+		if msg == nil || strOf(msg["role"]) != "assistant" {
+			return
+		}
+		s.mu.Lock()
+		if s.subagentThink[id] == nil {
+			s.subagentThink[id] = &strings.Builder{}
+		}
+		s.subagentThink[id].Reset()
+		s.mu.Unlock()
+	case "message_update":
+		aev, _ := ev["assistantMessageEvent"].(map[string]interface{})
+		if aev == nil || strOf(aev["type"]) != "thinking_delta" {
+			return
+		}
+		if d := strOf(aev["delta"]); d != "" {
+			s.mu.Lock()
+			if sb, ok := s.subagentThink[id]; ok {
+				sb.WriteString(d)
+			}
+			s.mu.Unlock()
+		}
+	case "message_end":
+		msg, _ := ev["message"].(map[string]interface{})
+		if msg == nil || strOf(msg["role"]) != "assistant" {
+			return
+		}
+		s.mu.Lock()
+		name := s.subagentName[id]
+		if name == "" {
+			name = id
+		}
+		thinking := ""
+		if sb, ok := s.subagentThink[id]; ok {
+			thinking = sb.String()
+			delete(s.subagentThink, id)
+		}
+		s.mu.Unlock()
+		if t := strings.TrimSpace(thinking); t != "" {
+			b.mirrorLine(s, fmt.Sprintf("\U0001F4AD %s: %s", name, truncateLine(t, 1000)))
+		}
+	}
+}
+
+func intOf(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
 }
 
 // Ensure the bridge satisfies the VK handler's backend interface.

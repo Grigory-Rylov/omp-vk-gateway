@@ -26,17 +26,19 @@ import (
 
 // config is the gateway configuration (config.json).
 type config struct {
-	TokenVK        string   `json:"token_vk"`
-	PeerID         int64    `json:"peer_id"`
-	ThinkingPeerID int64    `json:"thinking_peer_id"`
-	Workdir        string   `json:"workdir"`
-	Model          string   `json:"model"`
-	ThinkingLevel  string   `json:"thinking_level"`
-	ApprovalMode   string   `json:"approval_mode"`
-	Debug          bool     `json:"debug"`
-	LogFile        string   `json:"log_file"`
-	AgentCmd       []string `json:"agent_cmd"`
-	ExtraArgs      []string `json:"extra_args"`
+	TokenVK              string   `json:"token_vk"`
+	PeerID               int64    `json:"peer_id"`
+	ThinkingPeerID       int64    `json:"thinking_peer_id"`
+	Workdir              string   `json:"workdir"`
+	Model                string   `json:"model"`
+	ThinkingLevel        string   `json:"thinking_level"`
+	ApprovalMode         string   `json:"approval_mode"`
+	Debug                bool     `json:"debug"`
+	LogFile              string   `json:"log_file"`
+	AgentCmd             []string `json:"agent_cmd"`
+	ExtraArgs            []string `json:"extra_args"`
+	AgentNames           []string `json:"agent_names"`
+	SubagentSubscription string   `json:"subagent_subscription"`
 }
 
 // Version is the release label; the exact build time is stamped by
@@ -118,10 +120,36 @@ func main() {
 
 	vkClient := vk.NewBotClient(cfg.TokenVK)
 	backend := agent.NewBridge(cfg.AgentCmd, extraArgs, log)
+	backend.SetSubagentSubscription(cfg.SubagentSubscription)
+	// Persist per-peer coprocess state (session id/file, in-flight run_agent
+	// descriptors) so a gateway restart or host reboot resumes the same
+	// oh-my-pi session (via --resume) and re-issues interrupted @agent work.
+	backend.SetStateDir(filepath.Join(workdir, "debug"))
 
 	handler := vk.NewBotHandler(vkClient, backend, log,
 		cfg.PeerID, cfg.ThinkingPeerID, workdir)
 	handler.SetAttachmentsDir(filepath.Join(workdir, "attachments"))
+	if len(cfg.AgentNames) > 0 {
+		handler.SetAgentNames(cfg.AgentNames)
+	}
+
+	backend.SetRunAgentResultCallback(func(peerID int64, text string) error {
+		if text == "" {
+			return nil
+		}
+		// A directly-launched subagent's answer is surfaced in the reasoning
+		// chat (the peer its lifecycle is mirrored to); fall back to the
+		// originating chat when no reasoning peer is configured.
+		target := peerID
+		if cfg.ThinkingPeerID > 0 {
+			target = cfg.ThinkingPeerID
+		}
+		if _, err := vkClient.SendMessage(target, text); err != nil {
+			log.WarnLogf("Failed to deliver run_agent result to peer %d: %v", target, err)
+			return err
+		}
+		return nil
+	})
 
 	if cfg.ThinkingPeerID > 0 {
 		backend.SetThinkingCallback(func(peerID int64, line string) error {
@@ -131,6 +159,22 @@ func main() {
 			return nil
 		})
 	}
+
+	// A restart re-sends a peer's interrupted in-flight turn on its --resume
+	// session; the resulting answer has no incoming VK message to reply to,
+	// so it is delivered here to that peer's own chat (the turn is the user's
+	// own main-chat turn, unlike a directly-launched subagent which surfaces
+	// in the reasoning chat).
+	backend.SetReRunResultCallback(func(peerID int64, text string) error {
+		if text == "" {
+			return nil
+		}
+		if _, err := vkClient.SendMessage(peerID, text); err != nil {
+			log.WarnLogf("Failed to deliver re-run result to peer %d: %v", peerID, err)
+			return err
+		}
+		return nil
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -151,6 +195,10 @@ func main() {
 			log.WarnLogf("Failed to send startup message: %v", err)
 		}
 	}
+
+	// Restart survival: respawn persisted peers with --resume <sessionFile>
+	// and re-issue run_agent work that was in flight when the gateway died.
+	backend.ResumePeers()
 
 	log.InfoLog("Starting VK Bot Handler...")
 	if err := handler.Start(ctx); err != nil {

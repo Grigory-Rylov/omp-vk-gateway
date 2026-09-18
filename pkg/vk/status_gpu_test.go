@@ -33,12 +33,16 @@ func (b *statusTestBackend) SetModel(ctx context.Context, peerID int64, ref stri
 func (b *statusTestBackend) SteerText(ctx context.Context, message string, peerID int64) error {
 	return nil
 }
-func (b *statusTestBackend) Abort(peerID int64)                            {}
-func (b *statusTestBackend) AbortAll()                                     {}
-func (b *statusTestBackend) IsStreaming(peerID int64) bool                 { return false }
-func (b *statusTestBackend) WorkingDir(peerID int64) string                { return "" }
-func (b *statusTestBackend) SetThinkingCallback(func(int64, string) error) {}
-func (b *statusTestBackend) CloseAll()                                     {}
+func (b *statusTestBackend) Abort(peerID int64)                                  {}
+func (b *statusTestBackend) AbortAll()                                           {}
+func (b *statusTestBackend) IsStreaming(peerID int64) bool                       { return false }
+func (b *statusTestBackend) WorkingDir(peerID int64) string                      { return "" }
+func (b *statusTestBackend) SetThinkingCallback(func(int64, string) error)       {}
+func (b *statusTestBackend) CloseAll()                                           {}
+func (b *statusTestBackend) SetRunAgentResultCallback(func(int64, string) error) {}
+func (b *statusTestBackend) RunAgent(ctx context.Context, agent, task string, peerID int64) error {
+	return nil
+}
 
 func newStatusTestHandler(t *testing.T, backend AgentBackend) *BotHandler {
 	t.Helper()
