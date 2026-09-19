@@ -134,14 +134,14 @@ func (c *BotClient) dialViaDNSFallback(ctx context.Context, network, addr string
 func (c *BotClient) resolveHost(host string) (net.IP, error) {
 	resolvers := []struct {
 		name string
-		dns  net.Resolver
+		dns  *net.Resolver
 	}{
-		{"system", *net.DefaultResolver},
-		{"cloudflare", net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		{"system", net.DefaultResolver},
+		{"cloudflare", &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "udp", "1.1.1.1:53")
 		}}},
-		{"google", net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		{"google", &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "udp", "8.8.8.8:53")
 		}}},
