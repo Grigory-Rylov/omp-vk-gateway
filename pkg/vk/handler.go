@@ -741,6 +741,12 @@ func (h *BotHandler) Start(ctx context.Context) error {
 	if h.log != nil {
 		h.log.InfoLog("Starting VK Long Poll bot...")
 	}
+	// lastGoodTs is the highest ts fully consumed from long poll. We always
+	// resume from it after a transport-level disconnect instead of the fresh
+	// ts served by groups.getLongPollServer, so messages posted during the
+	// outage are not skipped. If VK considers it too old it answers
+	// failed=2 with the current ts, which runLongPoll adopts inline.
+	var lastGoodTs int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -759,12 +765,19 @@ func (h *BotHandler) Start(ctx context.Context) error {
 				}
 				continue
 			}
-			if h.log != nil {
-				h.log.InfoLog("Connected to VK Long Poll server")
+			if lastGoodTs > 0 {
+				ts = lastGoodTs
 			}
-			if err := h.runLongPoll(ctx, server, key, ts); err != nil {
+			if h.log != nil {
+				h.log.InfoLogf("Connected to VK Long Poll server (resume ts=%d)", ts)
+			}
+			runErr, newTs := h.runLongPoll(ctx, server, key, ts)
+			if newTs > 0 {
+				lastGoodTs = newTs
+			}
+			if runErr != nil {
 				if h.log != nil {
-					h.log.WarnLogf("Long poll disconnected: %v", err)
+					h.log.WarnLogf("Long poll disconnected: %v", runErr)
 				}
 				if !sleepCtx(ctx, 3*time.Second) {
 					return nil
@@ -785,22 +798,36 @@ func sleepCtx(ctx context.Context, d time.Duration) (awoken bool) {
 	}
 }
 
-func (h *BotHandler) runLongPoll(ctx context.Context, server, key string, ts int64) error {
+// runLongPoll polls until a fatal condition (transport failure that survived
+// retries, or context cancellation). It returns the error, if any, plus the
+// newest ts it confirmed with the server so the caller can resume exactly
+// there after a reconnect.
+func (h *BotHandler) runLongPoll(ctx context.Context, server, key string, ts int64) (error, int64) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return nil, ts
 		default:
 			messages, newTs, err := h.vkClient.CheckUpdates(ctx, server, key, ts)
 			if err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return nil, ts
 				}
 				if strings.Contains(err.Error(), "long poll failed") {
-					return err
+					// VK told us our ts is stale (usually failed=2). Adopt the
+					// corrected ts it handed back and keep polling on the same
+					// connection instead of tearing down and reconnecting.
+					if newTs > 0 {
+						ts = newTs
+						if !sleepCtx(ctx, time.Second) {
+							return nil, ts
+						}
+						continue
+					}
+					return err, ts
 				}
 				if !sleepCtx(ctx, time.Second) {
-					return nil
+					return nil, ts
 				}
 				continue
 			}

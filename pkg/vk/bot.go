@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"omp-vk-gateway/pkg/internalmsg"
@@ -86,47 +88,158 @@ type BotClient struct {
 }
 
 func NewBotClient(token string) *BotClient {
-	return &BotClient{
+	c := &BotClient{
 		token:      token,
 		apiVersion: "5.200",
 		baseURL:    "https://api.vk.com/method/",
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+	}
+	c.httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: c.dialViaDNSFallback,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     true,
 		},
 	}
+	return c
+}
+
+// dialViaDNSFallback connects to addr (host:port) resolving the host through
+// the fallback DNS chain, so a broken systemd-resolved never blinds the
+// gateway. Falls back to plain dialing for literal IPs.
+func (c *BotClient) dialViaDNSFallback(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if net.ParseIP(host) == nil {
+		ip, derr := c.resolveHost(host)
+		if derr != nil {
+			return nil, derr
+		}
+		addr = net.JoinHostPort(ip.String(), port)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+// dnsFallbackChain tries the system resolver first, then public resolvers.
+// systemd-resolved intermittently fails ("server misbehaving"), leaving the
+// gateway blind until someone touches the network stack. Falling back keeps
+// VK reachable regardless.
+func (c *BotClient) resolveHost(host string) (net.IP, error) {
+	resolvers := []struct {
+		name string
+		dns  net.Resolver
+	}{
+		{"system", *net.DefaultResolver},
+		{"cloudflare", net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", "1.1.1.1:53")
+		}}},
+		{"google", net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", "8.8.8.8:53")
+		}}},
+	}
+	var lastErr error
+	for _, r := range resolvers {
+		addrs, err := r.dns.LookupIPAddr(context.Background(), host)
+		if err == nil && len(addrs) > 0 {
+			ip := addrs[0].IP
+			logger.DebugToFile("[dns] resolved %s -> %s via %s", host, ip.String(), r.name)
+			return ip, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("all DNS resolvers failed for %s: %w", host, lastErr)
+}
+
+// retryTransient retries fn on transient network/DNS errors with exponential
+// backoff. VK API rate-limit and auth errors are not retried.
+func retryTransient(opName string, fn func() error) error {
+	backoffs := []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second}
+	var attemptErr error
+	for i, b := range backoffs {
+		attemptErr = fn()
+		if attemptErr == nil {
+			return nil
+		}
+		if !isTransientNetworkError(attemptErr) {
+			break
+		}
+		logger.DebugToFile("[%s] transient error (attempt %d/%d): %v", opName, i+1, len(backoffs)+1, attemptErr)
+		time.Sleep(b)
+	}
+	return attemptErr
+}
+
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"dial tcp:",
+		"lookup ",
+		"server misbehaving",
+		"connection refused",
+		"connection reset",
+		"EOF",
+		"context deadline exceeded",
+		"TLS handshake timeout",
+		"http2: timeout awaiting response headers",
+		"i/o timeout",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *BotClient) doRequestPOST(endpoint string, params map[string]interface{}) ([]byte, error) {
 	endpointURL := fmt.Sprintf("%s%s", c.baseURL, endpoint)
 
-	body := &bytes.Buffer{}
+	formBody := &bytes.Buffer{}
 	for k, v := range params {
-		if body.Len() > 0 {
-			body.WriteString("&")
+		if formBody.Len() > 0 {
+			formBody.WriteString("&")
 		}
 		val := formatValue(v)
-		body.WriteString(url.QueryEscape(k) + "=" + url.QueryEscape(val))
+		formBody.WriteString(url.QueryEscape(k) + "=" + url.QueryEscape(val))
 	}
+	bodyBytes := formBody.Bytes()
 
-	req, err := http.NewRequest("POST", endpointURL, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	var responseBody []byte
+	err := retryTransient("POST "+endpoint, func() error {
+		req, e := http.NewRequest("POST", endpointURL, bytes.NewReader(bodyBytes))
+		if e != nil {
+			return fmt.Errorf("failed to create request: %w", e)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.httpClient.Do(req)
+		r, e := c.httpClient.Do(req)
+		if e != nil {
+			return e
+		}
+		defer r.Body.Close()
+		b, e := io.ReadAll(r.Body)
+		if e != nil {
+			return fmt.Errorf("failed to read response: %w", e)
+		}
+		if r.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP error: %d, body: %s", r.StatusCode, string(b[:min(500, len(b))]))
+		}
+		responseBody = b
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d, body: %s", resp.StatusCode, string(responseBody[:min(500, len(responseBody))]))
 	}
 
 	var apiError struct {
@@ -154,19 +267,25 @@ func (c *BotClient) doRequestGET(endpoint string, params map[string]interface{})
 
 	reqURL += "?" + query
 
-	resp, err := c.httpClient.Get(reqURL)
+	var responseBody []byte
+	err := retryTransient("GET "+endpoint, func() error {
+		r, e := c.httpClient.Get(reqURL)
+		if e != nil {
+			return e
+		}
+		defer r.Body.Close()
+		b, e := io.ReadAll(r.Body)
+		if e != nil {
+			return fmt.Errorf("failed to read response: %w", e)
+		}
+		if r.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP error: %d", r.StatusCode)
+		}
+		responseBody = b
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
 	}
 
 	var apiError struct {
@@ -265,8 +384,11 @@ func (c *BotClient) CheckUpdates(ctx context.Context, server, key string, ts int
 		return nil, ts, fmt.Errorf("failed to parse response: %w (body: %s)", err, string(responseBody[:min(200, len(responseBody))]))
 	}
 
+	newTs := toInt64(result.Ts)
 	if result.Failed != 0 {
-		return nil, ts, fmt.Errorf("long poll failed: code=%d", result.Failed)
+		// failed=2 means "your ts is behind, here is the current one"; the
+		// caller can adopt newTs and keep going without a full reconnect.
+		return nil, newTs, fmt.Errorf("long poll failed: code=%d", result.Failed)
 	}
 
 	var messages []VKMessage
