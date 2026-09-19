@@ -23,6 +23,10 @@ The only supported gateway respawn mechanism is `touch .agent-restart`, which th
 - **`debug/gateway.log`** is a large append-only log. Never read it in full. Grep a narrow time window, e.g. `grep -a "2026-09-18T09:2" debug/gateway.log`.
 - **Do not run the full oh-my-pi test suite** from this repo. Verify this repo's own packages (`go test ./pkg/...`) only.
 
+## Code style
+
+- **Prefer self-documenting names over comments.** Name methods, types, and variables so their intent is obvious from the name; do not add a comment that merely restates what the code already says. Add a comment only for the non-obvious *why* — a constraint, a workaround, a subtle invariant — that the code cannot express on its own.
+
 ## VK message delivery
 
 `messages.send` requires an integer `random_id`. `messages.get` does not work with this token — verify delivery via `debug/gateway.log`, not the VK API.
