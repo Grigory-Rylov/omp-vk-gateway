@@ -754,7 +754,7 @@ func (c *BotClient) SendThinking(peerID int64, content string) (int64, error) {
 		return 0, fmt.Errorf("empty thinking content")
 	}
 
-	return c.SendMessage(peerID, content)
+	return c.SendMessage(peerID, SanitizeMentionAll(content))
 }
 
 func CreateQuestionKeyboard(header string, questionText string, options []map[string]string) map[string]interface{} {

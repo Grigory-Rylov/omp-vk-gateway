@@ -49,3 +49,23 @@ func TestNormalizeAgentMentions(t *testing.T) {
 		t.Errorf("SetAgentNames(nil) should disable: got %q", got)
 	}
 }
+func TestSanitizeMentionAll(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"*all", "＊all"},
+		{"*все", "＊все"},
+		{"--include=*all *.go", "--include=＊all *.go"},
+		{"pkill *все процессы", "pkill ＊все процессы"},
+		{"**all", "*＊all"}, // bold form carries the trigger too
+		{"*ALL", "＊ALL"},   // case-folded, word case preserved
+		{"*ВСЕ", "＊ВСЕ"},
+		{"grep install .", "grep install ."},   // "all" without '*'
+		{"**bold** text", "**bold** text"},     // no trigger
+		{"*.txt *.md", "*.txt *.md"},           // glob, not a trigger
+		{"3 * all of them", "3 * all of them"}, // '*' not glued to the word
+	}
+	for _, c := range cases {
+		if got := SanitizeMentionAll(c.in); got != c.want {
+			t.Errorf("SanitizeMentionAll(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

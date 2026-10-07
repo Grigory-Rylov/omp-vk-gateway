@@ -53,6 +53,17 @@ func (h *BotHandler) normalizeAgentMentions(message string) string {
 	})
 }
 
+// mentionAllRe matches VK's mention-all trigger: an ASCII '*' glued to "all"
+// or "все". Thinking lines carry shell globs and flags ("--include=*all",
+// "pkill *все") that would otherwise ping every member of the reasoning chat.
+var mentionAllRe = regexp.MustCompile(`(?i)\*(all|все)`)
+
+// SanitizeMentionAll neutralizes the trigger by swapping the ASCII '*' for
+// the fullwidth '＊', which VK does not parse and which reads identically.
+func SanitizeMentionAll(text string) string {
+	return mentionAllRe.ReplaceAllString(text, "＊$1")
+}
+
 // parseRunAgentDispatch reports whether message is a direct dispatch to a
 // known agent: a leading "@<name>" or "#<name>" (the VK chat encodes a typed
 // "@name" as an "[id|@name]" token, which extractCommand strips to "@name")

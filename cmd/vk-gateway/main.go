@@ -143,6 +143,7 @@ func main() {
 		target := peerID
 		if cfg.ThinkingPeerID > 0 {
 			target = cfg.ThinkingPeerID
+			text = vk.SanitizeMentionAll(text)
 		}
 		if _, err := vkClient.SendMessage(target, text); err != nil {
 			log.WarnLogf("Failed to deliver run_agent result to peer %d: %v", target, err)
