@@ -5,7 +5,6 @@ package agent
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,16 +101,21 @@ func TestResumePeersReissues(t *testing.T) {
 	if gotWd != "/home/u/work" || gotID != "sess-1" || gotFile != st.SessionFile {
 		t.Fatalf("resume did not restore peer state: wd=%q id=%q file=%q", gotWd, gotID, gotFile)
 	}
-	// The state file is removed once its runs have been re-issued.
-	// The state file persists after re-issue so a further restart
-	// (double reboot / restarter churn) still finds and re-issues the work.
-	if _, err := os.Stat(filepath.Join(dir, "agent-state-9.json")); err != nil {
-		t.Fatalf("state file should persist after re-issue, err=%v", err)
+	// The legacy per-peer file is migrated to the default state file, and
+	// that file persists after re-issue so a further restart (double
+	// reboot / restarter churn) still finds and re-issues the work.
+	if _, err := os.Stat(filepath.Join(dir, "agent-state.json")); err != nil {
+		t.Fatalf("default state file should persist after re-issue, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "agent-state-9.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy state file must be migrated away, stat err=%v", err)
 	}
 }
 
-// readPeerState loads one peer's persisted state file from the bridge's state
-// dir (package access; single-threaded tests need no locking).
+// readPeerState loads the peer's active session state file from the
+// bridge's state dir (package access; single-threaded tests need no
+// locking): agent-state.json for the default session,
+// agent-state-<alias>.json for a named one.
 func readPeerState(t *testing.T, s *peerSession) peerState {
 	t.Helper()
 	b := s.bridge
@@ -121,9 +125,12 @@ func readPeerState(t *testing.T, s *peerSession) peerState {
 	if dir == "" {
 		t.Fatal("state dir not configured")
 	}
-	data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("agent-state-%d.json", s.peerID)))
+	s.mu.Lock()
+	name := s.stateNameLocked()
+	s.mu.Unlock()
+	data, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
-		t.Fatalf("state file not found: %v", err)
+		t.Fatalf("state file %s not found: %v", name, err)
 	}
 	var st peerState
 	if err := json.Unmarshal(data, &st); err != nil {

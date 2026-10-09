@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,12 @@ type peerSession struct {
 	// the conversation context survives gateway restarts and host reboots.
 	resumeSessionID   string
 	resumeSessionFile string
+	// freshSessionDir isolates a reset respawn into a pristine
+	// --session-dir: oh-my-pi resolves a spawn without --resume to the
+	// newest session of the working dir, so without isolation /clear would
+	// silently re-attach the very session it was asked to clear. Consumed
+	// (and cleared) by startProcessLocked.
+	freshSessionDir string
 	// inFlightRuns persists run_agent descriptors (wire id -> descriptor)
 	// so interrupted work can be re-issued after a gateway restart; cleared
 	// on each run's terminal frame.
@@ -66,6 +73,25 @@ type peerSession struct {
 	// when the turn starts, cleared when it settles or the session is reset).
 	// Persisted so a restart/reboot re-sends it on the --resume session.
 	lastPrompt string
+	// alias is the user-chosen name of the session this peer currently
+	// holds ("" = the default session). It selects the state file:
+	// agent-state.json for the default session, agent-state-<alias>.json
+	// for a named one.
+	alias string
+	// switchRequested marks a session-switch respawn: unlike a reset the
+	// respawn scrubs and wipes nothing — it simply comes up on the new
+	// alias's resume target and workdir (both set by SwitchSession).
+	switchRequested bool
+}
+
+// stateNameLocked returns the state file name backing this session:
+// agent-state.json for the default session, agent-state-<alias>.json for
+// a named one. Caller holds s.mu.
+func (s *peerSession) stateNameLocked() string {
+	if s.alias == "" {
+		return defaultStateFileName
+	}
+	return stateFilePrefix + s.alias + stateFileSuffix
 }
 
 // resetSubagentState clears all per-subagent mirror state. Caller holds s.mu.
@@ -94,7 +120,6 @@ func (s *peerSession) startIfNeeded() {
 // startProcessLocked spawns a fresh process for the current workdir and
 // starts its event pump. Caller must hold s.mu.
 func (s *peerSession) startProcessLocked() {
-	s.resetRequested = false
 	wd := s.workdir
 	if wd == "" {
 		if wd, _ = os.Getwd(); wd == "" {
@@ -104,6 +129,13 @@ func (s *peerSession) startProcessLocked() {
 	b := s.bridge
 	proc := newProcess(s.peerID, b.log)
 	s.proc = proc
+	if s.resetRequested {
+		// Pending reset: this spawn is the fresh start — scrub session
+		// residue and arm the isolated session dir regardless of whether
+		// the requester caught a live, dead or never-spawned process.
+		s.resetRequested = false
+		s.prepareResetRespawnLocked()
+	}
 	// Resume the previous oh-my-pi session when its file still exists on
 	// disk; otherwise fall back to a fresh session and drop the stale
 	// resume values (oh-my-pi exits cleanly on a missing resume target,
@@ -117,8 +149,17 @@ func (s *peerSession) startProcessLocked() {
 			resume = ""
 		}
 	}
+	sessionDir := s.freshSessionDir
+	if sessionDir != "" {
+		s.freshSessionDir = ""
+	}
+	extra := b.extraArgs
+	if sessionDir != "" {
+		extra = append(append([]string{}, b.extraArgs...), "--session-dir", sessionDir)
+		s.debugf("reset respawn: isolated --session-dir %s", sessionDir)
+	}
 	go func() {
-		if err := proc.spawn(wd, resume, b.agentCmd, b.extraArgs); err != nil {
+		if err := proc.spawn(wd, resume, b.agentCmd, extra); err != nil {
 			s.debugf("spawn failed: %v", err)
 			if b.log != nil {
 				b.log.ErrorLogf("peer %d: spawn failed: %v", s.peerID, err)
@@ -176,7 +217,8 @@ func (s *peerSession) waitReady(ctx context.Context) (*process, error) {
 	}
 }
 
-// supervise respawns the process when it dies and applies pending resets.
+// supervise respawns the process when it dies and applies pending resets
+// and session switches.
 func (b *Bridge) supervise(peerID int64, s *peerSession) {
 	for {
 		s.mu.Lock()
@@ -196,10 +238,8 @@ func (b *Bridge) supervise(peerID int64, s *peerSession) {
 			return
 		}
 		resetReq := s.resetRequested
+		switchReq := s.switchRequested
 		wd := s.workdir
-		if resetReq {
-			s.resetRequested = false
-		}
 		s.mu.Unlock()
 
 		if resetReq {
@@ -209,17 +249,30 @@ func (b *Bridge) supervise(peerID int64, s *peerSession) {
 				s.mu.Unlock()
 				return
 			}
-			// An explicit /clear or /newsession is a fresh start: drop the
-			// persisted resume target and in-flight runs so the respawn opens
-			// a clean session. Crash respawns (resetReq false) keep the
-			// session for --resume.
-			s.resumeSessionID = ""
-			s.resumeSessionFile = ""
-			s.lastPrompt = ""
-			for id := range s.inFlightRuns {
-				delete(s.inFlightRuns, id)
+			// startProcessLocked consumes the pending reset: it scrubs
+			// the persisted resume target and in-flight state and arms
+			// the isolated --session-dir, so the respawn opens a clean
+			// session. Crash respawns (no pending reset) keep the
+			// session for --resume. A reset supersedes a pending switch.
+			s.switchRequested = false
+			s.startProcessLocked()
+			s.notifyResetLocked()
+			s.mu.Unlock()
+			continue
+		}
+
+		if switchReq {
+			s.debugf("respawning after session switch, workdir %q", wd)
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				return
 			}
-			b.persistStateLocked(s)
+			// A switch scrubs and wipes nothing: the old session's files
+			// stay on disk for a later switch back, and startProcessLocked
+			// spawns on the new alias's resume target + workdir that
+			// SwitchSession already installed.
+			s.switchRequested = false
 			s.startProcessLocked()
 			s.notifyResetLocked()
 			s.mu.Unlock()
@@ -266,6 +319,7 @@ func (s *peerSession) requestReset(workdir string) {
 	}
 	wd := s.workdir
 	s.resetRequested = true
+	s.switchRequested = false
 	s.turnActive = false
 	s.turnAborted = true
 	proc := s.proc
@@ -275,6 +329,80 @@ func (s *peerSession) requestReset(workdir string) {
 	s.notifyResetLocked()
 	s.mu.Unlock()
 	s.debugf("reset requested, workdir %q", wd)
+}
+
+// prepareResetRespawnLocked scrubs everything a respawn would resurrect of
+// the session being reset (resume target, in-flight prompt, run queue) and
+// arms an isolated --session-dir for the ensuing spawn: oh-my-pi resolves a
+// spawn without --resume to the newest session of the working dir, so the
+// pristine dir is what actually separates the fresh session from the one
+// the peer just cleared. Caller holds s.mu.
+func (s *peerSession) prepareResetRespawnLocked() {
+	// Wipe the cleared session's own storage before scrubbing the pin:
+	// oh-my-pi's no-resume launcher falls back to the newest session of
+	// the working dir, so an orphaned file on disk puts the cleared
+	// context straight back. Only the pinned session (its jsonl +
+	// companion dir) is removed — siblings may belong to other peers of
+	// the same workdir. Failure degrades to the quarantine layer only.
+	stale := s.resumeSessionFile
+	s.resumeSessionID = ""
+	s.resumeSessionFile = ""
+	s.lastPrompt = ""
+	for id := range s.inFlightRuns {
+		delete(s.inFlightRuns, id)
+	}
+	if dir, err := os.MkdirTemp("", "omp-clear-XXXXXXXX"); err == nil {
+		s.freshSessionDir = dir
+	}
+	if stale != "" {
+		if err := removeSessionArtifacts(stale); err != nil {
+			s.debugf("clear: failed to wipe old session %s: %v", stale, err)
+		}
+	}
+	s.bridge.persistStateLocked(s)
+}
+
+// removeSessionArtifacts deletes an oh-my-pi session's on-disk storage:
+// the session jsonl plus its companion dir (the same path without the
+// .jsonl extension) when present. A missing artifact is not an error;
+// only real removal failures are reported.
+func removeSessionArtifacts(path string) error {
+	if path == "" {
+		return nil
+	}
+	var firstErr error
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		firstErr = err
+	}
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	companion := filepath.Join(filepath.Dir(path), base)
+	if fi, serr := os.Lstat(companion); serr == nil && fi.IsDir() {
+		if err := removeAllBelow(companion); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// removeAllBelow deletes a directory's content recursively, keeping the
+// directory itself.
+func removeAllBelow(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		full := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			if err := removeAllBelow(full); err != nil {
+				return err
+			}
+		}
+		if err := os.Remove(full); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // abortTurn cancels the in-flight turn (best-effort abort RPC) so it

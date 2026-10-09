@@ -34,8 +34,25 @@ func TestParseRunAgentDispatch(t *testing.T) {
 	}
 }
 
+// namedSessionsStub provides no-op named-session operations for the
+// AgentBackend doubles in this package's tests.
+type namedSessionsStub struct{}
+
+func (namedSessionsStub) SaveSession(peerID int64, alias string) error { return nil }
+func (namedSessionsStub) SwitchSession(ctx context.Context, peerID int64, alias string) error {
+	return nil
+}
+func (namedSessionsStub) NewSessionNamed(ctx context.Context, peerID int64, alias, workdir string) error {
+	return nil
+}
+func (namedSessionsStub) DeleteSession(ctx context.Context, peerID int64, alias string) error {
+	return nil
+}
+func (namedSessionsStub) ListSessions(peerID int64) (string, error) { return "", nil }
+
 // recordingBackend is an AgentBackend that records run_agent launches.
 type recordingBackend struct {
+	namedSessionsStub
 	launched []string // "agent|task"
 	err      error
 }
@@ -44,7 +61,6 @@ func (b *recordingBackend) EnsureSession(peerID int64) {}
 func (b *recordingBackend) ProcessMessage(ctx context.Context, message string, peerID int64) (string, error) {
 	return "", nil
 }
-func (b *recordingBackend) NewSession(ctx context.Context, peerID int64) error { return nil }
 func (b *recordingBackend) ResetSession(ctx context.Context, peerID int64, workdir string) error {
 	return nil
 }

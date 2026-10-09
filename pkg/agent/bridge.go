@@ -10,8 +10,8 @@
 //     isTerminal absent or true (a field set to false means the agent
 //     deferred completion and will continue — keep waiting)
 //   - streaming msg -> "steer" command
-//   - /clear        -> "new_session" (process and cwd preserved)
-//   - /newsession   -> process killed and respawned with the new --cwd
+//   - /clear, /newsession -> process killed and respawned (/newsession also
+//     switches --cwd, /clear keeps the current one)
 //   - /models /r    -> "get_available_models" / "set_model"
 //
 // Streaming events (text_delta, thinking_delta, tool_execution_start, ...)
@@ -73,11 +73,13 @@ func NewBridge(agentCmd []string, extraArgs []string, log *logger.Logger) *Bridg
 	}
 }
 
-// SetStateDir points the bridge at a directory where per-peer state files
-// (agent-state-<peerID>.json: workdir, oh-my-pi session id/file, in-flight
-// run_agent descriptors) are persisted, so a restarted gateway can respawn
-// each coprocess with --resume <sessionFile> (same conversation context)
-// and re-issue run_agent work that was in flight.
+// SetStateDir points the bridge at a directory where session state files
+// live: agent-state.json (the default session), agent-state-<alias>.json
+// (named sessions) and active-<peerID>.json pointers to each peer's
+// active session (workdir, oh-my-pi session id/file, in-flight run_agent
+// descriptors), so a restarted gateway can respawn each coprocess with
+// --resume <sessionFile> (same conversation context) and re-issue
+// run_agent work that was in flight.
 func (b *Bridge) SetStateDir(dir string) {
 	b.mu.Lock()
 	b.stateDir = dir
@@ -90,17 +92,22 @@ func (b *Bridge) SetStateDir(dir string) {
 	}
 }
 
-func (b *Bridge) stateFileLocked(peerID int64) string {
+// stateFileLocked resolves a state file name (agent-state.json for the
+// default session, agent-state-<alias>.json for a named one) inside the
+// configured state dir.
+func (b *Bridge) stateFileLocked(name string) string {
 	if b.stateDir == "" {
 		return ""
 	}
-	return filepath.Join(b.stateDir, fmt.Sprintf("agent-state-%d.json", peerID))
+	return filepath.Join(b.stateDir, name)
 }
 
-// persistStateLocked atomically writes the peer's state file (tmp+rename).
-// No-op when no state dir is configured. Caller holds s.mu.
+// persistStateLocked atomically writes the session's state file
+// (tmp+rename): agent-state.json for the default session,
+// agent-state-<alias>.json for a named one. No-op when no state dir is
+// configured. Caller holds s.mu.
 func (b *Bridge) persistStateLocked(s *peerSession) {
-	f := b.stateFileLocked(s.peerID)
+	f := b.stateFileLocked(s.stateNameLocked())
 	if f == "" {
 		return
 	}
@@ -110,6 +117,9 @@ func (b *Bridge) persistStateLocked(s *peerSession) {
 		SessionFile:  s.resumeSessionFile,
 		InFlightRuns: s.inFlightRuns,
 		LastPrompt:   s.lastPrompt,
+		Alias:        s.alias,
+		PeerID:       s.peerID,
+		LastUsed:     nowRFC3339(),
 	})
 	if err != nil {
 		return
@@ -125,7 +135,7 @@ func (b *Bridge) persistStateLocked(s *peerSession) {
 // capture is logged and ignored: the next capture point retries.
 func (b *Bridge) refreshSessionState(s *peerSession, proc *process) {
 	// No ready() gate: the coprocess is already ready (the post-ready capture
-	// runs before markReady, and agent_end /clear capture run after). The
+	// runs before markReady, and the agent_end capture runs after). The
 	// request timeout is the safety for a dead or not-yet-responding process.
 	if proc == nil || proc.done() {
 		return
@@ -153,7 +163,9 @@ type runDescriptor struct {
 	Task  string `json:"task"`
 }
 
-// peerState is one per-peer state file (agent-state-<peerID>.json).
+// peerState is one session state file (agent-state.json for the default
+// session, agent-state-<alias>.json for a named one). Sessions are keyed
+// by alias; a peer points at its active session via active-<peerID>.json.
 type peerState struct {
 	Workdir      string                    `json:"workdir,omitempty"`
 	SessionID    string                    `json:"sessionId,omitempty"`
@@ -165,13 +177,27 @@ type peerState struct {
 	// auto-continue a dangling turn, and /retry no-ops on a hard-kill that
 	// leaves only a user message, so re-prompting is the only robust re-issue.
 	LastPrompt string `json:"lastPrompt,omitempty"`
+	// Alias is the user-chosen session name ("" = the default session).
+	Alias string `json:"alias,omitempty"`
+	// PeerID is the peer that last owned this session. The default file
+	// has no other identity (it is not named after the peer anymore);
+	// named sessions are keyed by alias.
+	PeerID int64 `json:"peerId,omitempty"`
+	// LastUsed is the RFC3339 UTC timestamp of the last persist; the
+	// /sessions listing sorts by it.
+	LastUsed string `json:"lastUsed,omitempty"`
 }
 
-// ResumePeers restores persisted state after a gateway restart: each coprocess
-// respawns with --resume <sessionFile> (same session context) and every
-// in-flight run_agent is re-issued (the interrupted run's disk state
-// survives; oh-my-pi has no subagent-resume RPC, so a restart is the honest
-// recovery). State files are removed once their runs are re-issued.
+// ResumePeers restores persisted state after a gateway restart. The active
+// pointer (active-<peerID>.json) is the cold-start contract: each peer is
+// seeded from the session its pointer names (the default agent-state.json
+// when the pointer is absent or empty) so the respawn comes up with
+// --resume <sessionFile> on the active alias's session and its workdir,
+// and every in-flight run_agent / in-flight prompt is re-issued (the
+// interrupted run's disk state survives; oh-my-pi has no subagent-resume
+// RPC, so a restart is the honest recovery). Legacy per-peer files
+// (agent-state-<peerID>.json, pre-named-sessions) are migrated to the
+// default file. State files are kept so a further restart re-issues again.
 func (b *Bridge) ResumePeers() {
 	b.mu.Lock()
 	dir := b.stateDir
@@ -184,95 +210,164 @@ func (b *Bridge) ResumePeers() {
 	if err != nil {
 		return
 	}
+
+	// Pass 1: active pointers — the authoritative per-peer session choice.
+	seeded := map[int64]bool{}
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, "agent-state-") || !strings.HasSuffix(name, ".json") {
+		if e.IsDir() || !strings.HasPrefix(name, activeFilePrefix) || !strings.HasSuffix(name, stateFileSuffix) {
 			continue
 		}
-		peerID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, "agent-state-"), ".json"), 10, 64)
+		peerID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, activeFilePrefix), stateFileSuffix), 10, 64)
 		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
+		alias, ok := readActivePointer(filepath.Join(dir, name))
+		if !ok {
 			continue
 		}
-		var st peerState
-		if json.Unmarshal(data, &st) != nil {
-			b.log.WarnLogf("resume peer %d: unreadable state", peerID)
+		seeded[peerID] = true
+		st, found := loadStateFile(filepath.Join(dir, stateFileName(alias)))
+		if !found && alias == "" {
+			// The default session may still sit in this peer's legacy file.
+			if b.migrateLegacyState(peerID) {
+				st, found = loadStateFile(filepath.Join(dir, defaultStateFileName))
+			}
+		}
+		if !found {
+			if b.log != nil {
+				b.log.WarnLogf("resume peer %d: session %s not found; starting fresh", peerID, sessionLabel(alias))
+			}
+			b.resumePeer(peerID, alias, peerState{}, hasCmd)
 			continue
 		}
-		s := b.session(peerID)
-		s.mu.Lock()
-		if st.Workdir != "" {
-			s.workdir = st.Workdir
-		}
-		s.resumeSessionID = st.SessionID
-		s.resumeSessionFile = st.SessionFile
-		s.mu.Unlock()
-		// Re-issue interrupted @agent runs. Gated on a usable agent command so
-		// unit tests (no coprocess command configured) still exercise state
-		// restoration + descriptor consumption; production always sets one.
-		if len(st.InFlightRuns) > 0 {
-			if !hasCmd {
-				if b.log != nil {
-					b.log.WarnLogf("peer %d: %d in-flight run(s) not re-issued (no agent command)", peerID, len(st.InFlightRuns))
-				}
-			} else {
-				b.log.InfoLogf("peer %d: re-issuing %d in-flight run(s) after restart", peerID, len(st.InFlightRuns))
-				for _, r := range st.InFlightRuns {
-					if r == nil {
-						continue
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-					if err := b.RunAgent(ctx, r.Agent, r.Task, peerID); err != nil {
-						b.log.WarnLogf("peer %d: re-issue @%s run failed: %v", peerID, r.Agent, err)
-					}
-					cancel()
-				}
-			}
-		}
-		// Re-issue the interrupted main-bot turn: re-send the last in-flight
-		// prompt as a fresh turn on the --resume session. The answer is
-		// delivered via the reRunResult callback (no ProcessMessage waiter).
-		if st.LastPrompt != "" {
-			if !hasCmd {
-				if b.log != nil {
-					b.log.WarnLogf("peer %d: in-flight turn not re-issued (no agent command)", peerID)
-				}
-			} else {
-				if b.log != nil {
-					b.log.InfoLogf("peer %d: re-issuing in-flight turn after restart: %.120s", peerID, st.LastPrompt)
-				}
-				go func(peerID int64, prompt string) {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-					defer cancel()
-					text, err := b.ProcessMessage(ctx, prompt, peerID)
-					if err != nil {
-						if b.log != nil {
-							b.log.WarnLogf("peer %d: re-run turn failed: %v", peerID, err)
-						}
-						return
-					}
-					if text == "" {
-						return
-					}
-					b.mu.Lock()
-					cb := b.reRunResult
-					b.mu.Unlock()
-					if cb == nil {
-						return
-					}
-					if err := cb(peerID, text); err != nil && b.log != nil {
-						b.log.WarnLogf("peer %d: re-run result delivery failed: %v", peerID, err)
-					}
-				}(peerID, st.LastPrompt)
-			}
-		}
-		// Keep the state file: the re-issued work re-persists its own
-		// descriptors below, so a further restart (double reboot, restarter
-		// churn) still finds the work and re-issues it again.
+		b.resumePeer(peerID, alias, st, hasCmd)
 	}
+
+	// Pass 2: default + legacy files for peers without a pointer.
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == defaultStateFileName {
+			// The default file carries no peer in its name; its PeerID
+			// field says whose session it is. Peers with a pointer were
+			// already seeded from their alias file.
+			st, found := loadStateFile(filepath.Join(dir, name))
+			if !found || st.PeerID == 0 || seeded[st.PeerID] {
+				continue
+			}
+			seeded[st.PeerID] = true
+			b.resumePeer(st.PeerID, "", st, hasCmd)
+			continue
+		}
+		if !strings.HasPrefix(name, stateFilePrefix) || !strings.HasSuffix(name, stateFileSuffix) {
+			continue
+		}
+		// Legacy per-peer file (agent-state-<peerID>.json): migrate it to
+		// the default file, content intact. Named sessions (non-numeric
+		// names) resume only through their peer's active pointer.
+		peerID, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, stateFilePrefix), stateFileSuffix), 10, 64)
+		if err != nil || seeded[peerID] {
+			continue
+		}
+		if !b.migrateLegacyState(peerID) {
+			if b.log != nil {
+				b.log.WarnLogf("resume peer %d: legacy %s left in place (default session file already exists)", peerID, name)
+			}
+			continue
+		}
+		seeded[peerID] = true
+		if st, found := loadStateFile(filepath.Join(dir, defaultStateFileName)); found {
+			b.resumePeer(peerID, "", st, hasCmd)
+		}
+	}
+}
+
+// resumePeer seeds one peer session from a persisted state file and
+// re-issues its interrupted work. The respawn itself is lazy:
+// EnsureSession (or the first message) spawns the coprocess with the
+// resume target and workdir installed here. Re-issue is gated on a usable
+// agent command so unit tests (no coprocess command configured) still
+// exercise state restoration + descriptor consumption; production always
+// sets one.
+func (b *Bridge) resumePeer(peerID int64, alias string, st peerState, hasCmd bool) {
+	s := b.session(peerID)
+	s.mu.Lock()
+	s.alias = alias
+	if st.Workdir != "" {
+		s.workdir = st.Workdir
+	}
+	s.resumeSessionID = st.SessionID
+	s.resumeSessionFile = st.SessionFile
+	s.inFlightRuns = map[string]*runDescriptor{}
+	for id, r := range st.InFlightRuns {
+		s.inFlightRuns[id] = r
+	}
+	s.lastPrompt = st.LastPrompt
+	b.persistStateLocked(s)
+	s.mu.Unlock()
+	// Re-issue interrupted @agent runs.
+	if len(st.InFlightRuns) > 0 {
+		if !hasCmd {
+			if b.log != nil {
+				b.log.WarnLogf("peer %d: %d in-flight run(s) not re-issued (no agent command)", peerID, len(st.InFlightRuns))
+			}
+		} else {
+			b.log.InfoLogf("peer %d: re-issuing %d in-flight run(s) after restart", peerID, len(st.InFlightRuns))
+			for _, r := range st.InFlightRuns {
+				if r == nil {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+				if err := b.RunAgent(ctx, r.Agent, r.Task, peerID); err != nil {
+					b.log.WarnLogf("peer %d: re-issue @%s run failed: %v", peerID, r.Agent, err)
+				}
+				cancel()
+			}
+		}
+	}
+	// Re-issue the interrupted main-bot turn: re-send the last in-flight
+	// prompt as a fresh turn on the --resume session. The answer is
+	// delivered via the reRunResult callback (no ProcessMessage waiter).
+	if st.LastPrompt != "" {
+		if !hasCmd {
+			if b.log != nil {
+				b.log.WarnLogf("peer %d: in-flight turn not re-issued (no agent command)", peerID)
+			}
+		} else {
+			if b.log != nil {
+				b.log.InfoLogf("peer %d: re-issuing in-flight turn after restart: %.120s", peerID, st.LastPrompt)
+			}
+			go func(peerID int64, prompt string) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				defer cancel()
+				text, err := b.ProcessMessage(ctx, prompt, peerID)
+				if err != nil {
+					if b.log != nil {
+						b.log.WarnLogf("peer %d: re-run turn failed: %v", peerID, err)
+					}
+					return
+				}
+				if text == "" {
+					return
+				}
+				b.mu.Lock()
+				cb := b.reRunResult
+				b.mu.Unlock()
+				if cb == nil {
+					return
+				}
+				if err := cb(peerID, text); err != nil && b.log != nil {
+					b.log.WarnLogf("peer %d: re-run result delivery failed: %v", peerID, err)
+				}
+			}(peerID, st.LastPrompt)
+		}
+	}
+	// Keep the state file: the re-issued work re-persists its own
+	// descriptors below, so a further restart (double reboot, restarter
+	// churn) still finds the work and re-issues it again.
 }
 
 // SetThinkingCallback registers the mirror sink (peerID, line) for
@@ -651,40 +746,9 @@ func (s *peerSession) waitTurnResult(ctx context.Context) (string, error) {
 	}
 }
 
-// NewSession resets the peer's session in place (working dir preserved).
-func (b *Bridge) NewSession(ctx context.Context, peerID int64) error {
-	s := b.session(peerID)
-	s.mu.Lock()
-	proc := s.proc
-	active := s.turnActive
-	s.mu.Unlock()
-
-	if active {
-		s.abortTurn()
-	}
-	if proc == nil || proc.done() || !proc.ready() {
-		return nil // fresh process will start clean
-	}
-	resp, err := b.request(s, proc, ctx, "new_session", map[string]interface{}{}, 15*time.Second)
-	if err != nil {
-		return err
-	}
-	var data struct {
-		Cancelled bool `json:"cancelled"`
-	}
-	if resp.Data != nil {
-		_ = json.Unmarshal(resp.Data, &data)
-	}
-	if data.Cancelled {
-		s.abortTurn()
-	}
-	// /clear rotates the coprocess into a fresh session: capture its new
-	// id/file so a later restart resumes the post-reset context.
-	b.refreshSessionState(s, proc)
-	return nil
-}
-
-// ResetSession stops the peer's agent and respawns it in workdir.
+// ResetSession stops the peer's agent and respawns it in workdir; an
+// empty workdir keeps the peer's current one. The reset respawn opens a
+// clean session (resume target, in-flight prompt and run queue dropped).
 func (b *Bridge) ResetSession(ctx context.Context, peerID int64, workdir string) error {
 	s := b.session(peerID)
 	s.requestReset(workdir)

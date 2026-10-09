@@ -47,10 +47,28 @@ type AgentBackend interface {
 	// the coprocess accepts the run, and the subagent's final text arrives via
 	// SetRunAgentResultCallback when the run settles.
 	RunAgent(ctx context.Context, agent, task string, peerID int64) error
-	// NewSession resets the in-flight session in place (working dir preserved).
-	NewSession(ctx context.Context, peerID int64) error
-	// ResetSession stops the agent and respawns it in the given workdir.
+	// ResetSession resets the peer's session: the coprocess is killed and
+	// respawned; an empty workdir keeps the current one, a non-empty one
+	// switches it before the respawn.
 	ResetSession(ctx context.Context, peerID int64, workdir string) error
+	// SaveSession registers (or re-registers) the peer's current session
+	// under alias and makes it the peer's active session.
+	SaveSession(peerID int64, alias string) error
+	// SwitchSession switches the peer to the named session (the alias
+	// "default" selects the unnamed one); the coprocess is killed and
+	// respawned on the target session.
+	SwitchSession(ctx context.Context, peerID int64, alias string) error
+	// NewSessionNamed creates a fresh session under alias (error when the
+	// alias is taken) and switches to it; an empty workdir keeps the
+	// peer's current one.
+	NewSessionNamed(ctx context.Context, peerID int64, alias, workdir string) error
+	// DeleteSession removes a named session (state file + agent session
+	// artifacts); deleting the peer's active session switches it to the
+	// default one first.
+	DeleteSession(ctx context.Context, peerID int64, alias string) error
+	// ListSessions returns a human-readable list of the peer's sessions,
+	// the active one marked with ▶.
+	ListSessions(peerID int64) (string, error)
 	// Status returns a human-readable multi-line status block.
 	Status(ctx context.Context, peerID int64) (string, error)
 	// Models lists available models and the current "provider/id" reference.
@@ -131,7 +149,7 @@ type BotHandler struct {
 const maxConcurrentHandlers = 10
 
 // NewBotHandler creates a handler. defaultWorkdir is the working directory
-// given to peers on first contact (and by /clear).
+// given to peers on first contact and restored by /n without an argument.
 func NewBotHandler(vkClient *BotClient, backend AgentBackend, log *logger.Logger,
 	mainPeerID, thinkingPeerID int64, defaultWorkdir string) *BotHandler {
 	return &BotHandler{
@@ -368,10 +386,30 @@ func (h *BotHandler) handleCommand(input string, peerID int64) string {
 	case "/newsession", "/n":
 		return h.handleNewSession(input, peerID)
 
+	case "/new":
+		return h.handleNewNamedSession(input, peerID)
+
+	case "/switch", "/s":
+		return h.handleSwitchSession(input, peerID)
+
+	case "/save":
+		return h.handleSaveSession(input, peerID)
+
+	case "/del", "/delete":
+		return h.handleDeleteSession(input, peerID)
+
+	case "/sessions":
+		return h.handleSessions(peerID)
+
 	case "/help":
 		return "Доступные команды:\n" +
-			"/clear — Очистить историю диалога (рабочая директория сохраняется)\n" +
-			"/newsession [path] (/n) — Сбросить сессию и сменить рабочую директорию\n" +
+			"/clear — Сбросить сессию, очистить историю диалога (рабочая директория сохраняется)\n" +
+			"/newsession [path] (/n) — Сбросить сессию и сменить рабочую директорию; без path — вернуться к рабочей директории шлюза\n" +
+			"/new <имя> [путь] — Создать новую именованную сессию (путь — рабочая директория)\n" +
+			"/switch <имя> (/s) — Переключиться на сессию; default — обычная сессия\n" +
+			"/save <имя> — Сохранить текущую сессию под именем <имя>\n" +
+			"/sessions — Список сессий (▶ — активная)\n" +
+			"/del <имя> (/delete) — Удалить сессию\n" +
 			"/status — Статус агента: модель, сессия, контекст, GPU (если есть nvidia-smi)\n" +
 			"/log — Отправить файлы из папки debug/\n" +
 			"/m, /models — Список доступных моделей\n" +
@@ -414,7 +452,11 @@ func (h *BotHandler) handleClear(peerID int64) string {
 	if wd == "" {
 		wd = h.defaultWorkdir
 	}
-	if err := h.backend.NewSession(ctx, peerID); err != nil {
+	if wd == "" {
+		wd, _ = os.Getwd()
+	}
+	h.cancelActiveRequest(peerID)
+	if err := h.backend.ResetSession(ctx, peerID, ""); err != nil {
 		if h.log != nil {
 			h.log.WarnLogf("/clear for peer %d: %v", peerID, err)
 		}
@@ -430,9 +472,8 @@ func (h *BotHandler) handleNewSession(input string, peerID int64) string {
 	if len(parts) > 1 {
 		newPath = strings.TrimSpace(parts[1])
 	}
-	if newPath == "" {
-		newPath = h.backend.WorkingDir(peerID)
-	}
+	// No path: return to the gateway's own workdir (configured default,
+	// falling back to the gateway's CWD).
 	if newPath == "" {
 		newPath = h.defaultWorkdir
 	}
@@ -471,6 +512,152 @@ func (h *BotHandler) handleNewSession(input string, peerID int64) string {
 		h.log.InfoLogf("Session reset for peer %d, working dir: %s", peerID, absPath)
 	}
 	return fmt.Sprintf("Сессия сброшена.\nРабочая директория: %s", absPath)
+}
+
+// sessionArg extracts the single argument of /switch, /save, /del.
+func sessionArg(input string) string {
+	parts := strings.SplitN(strings.TrimSpace(input), " ", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	fields := strings.Fields(parts[1])
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// activeWorkdir resolves the peer's working directory for command replies,
+// falling back to the gateway default like /clear does.
+func (h *BotHandler) activeWorkdir(peerID int64) string {
+	wd := h.backend.WorkingDir(peerID)
+	if wd == "" {
+		wd = h.defaultWorkdir
+	}
+	if wd == "" {
+		wd, _ = os.Getwd()
+	}
+	return wd
+}
+
+// handleNewNamedSession implements /new <alias> [path]: creates a fresh
+// named session (optionally in path) and switches the peer to it.
+func (h *BotHandler) handleNewNamedSession(input string, peerID int64) string {
+	parts := strings.Fields(input)
+	if len(parts) < 2 {
+		return "Использование: /new <имя сессии> [путь]"
+	}
+	alias := parts[1]
+	workdir := ""
+	if len(parts) > 2 {
+		workdir = expandTilde(parts[2])
+		info, err := os.Stat(workdir)
+		if err != nil || !info.IsDir() {
+			return fmt.Sprintf("Ошибка: директория '%s' не существует.", workdir)
+		}
+		abs, err := filepath.Abs(workdir)
+		if err != nil {
+			return fmt.Sprintf("Ошибка: не удалось получить абсолютный путь: %v", err)
+		}
+		workdir = abs
+	}
+	h.cancelActiveRequest(peerID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.backend.NewSessionNamed(ctx, peerID, alias, workdir); err != nil {
+		if h.log != nil {
+			h.log.WarnLogf("/new for peer %d: %v", peerID, err)
+		}
+		return fmt.Sprintf("❌ Не удалось создать сессию: %v", err)
+	}
+	h.bumpPeerGeneration(peerID)
+	if h.log != nil {
+		h.log.InfoLogf("New session %q for peer %d, working dir: %s", alias, peerID, h.activeWorkdir(peerID))
+	}
+	return fmt.Sprintf("Новая сессия %s\nРабочая директория: %s", alias, h.activeWorkdir(peerID))
+}
+
+// handleSwitchSession implements /switch <alias> (/s): moves the peer to
+// another saved session (default = the unnamed one).
+func (h *BotHandler) handleSwitchSession(input string, peerID int64) string {
+	alias := sessionArg(input)
+	if alias == "" {
+		return "Использование: /switch <имя сессии> (default — обычная сессия). Список: /sessions"
+	}
+	h.cancelActiveRequest(peerID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.backend.SwitchSession(ctx, peerID, alias); err != nil {
+		if h.log != nil {
+			h.log.WarnLogf("/switch for peer %d: %v", peerID, err)
+		}
+		return fmt.Sprintf("❌ %v", err)
+	}
+	h.bumpPeerGeneration(peerID)
+	return fmt.Sprintf("Переключено на сессию %s\nРабочая директория: %s", alias, h.activeWorkdir(peerID))
+}
+
+// handleSaveSession implements /save <alias>: (re-)registers the current
+// session under a name.
+func (h *BotHandler) handleSaveSession(input string, peerID int64) string {
+	alias := sessionArg(input)
+	if alias == "" {
+		return "Использование: /save <имя сессии>"
+	}
+	if err := h.backend.SaveSession(peerID, alias); err != nil {
+		if h.log != nil {
+			h.log.WarnLogf("/save for peer %d: %v", peerID, err)
+		}
+		return fmt.Sprintf("❌ Не удалось сохранить сессию: %v", err)
+	}
+	return fmt.Sprintf("Текущая сессия сохранена как %s\nРабочая директория: %s", alias, h.activeWorkdir(peerID))
+}
+
+// handleDeleteSession implements /del <alias> (/delete): removes a saved
+// session; deleting the active one switches the peer to default first.
+func (h *BotHandler) handleDeleteSession(input string, peerID int64) string {
+	alias := sessionArg(input)
+	if alias == "" {
+		return "Использование: /del <имя сессии>. Список: /sessions"
+	}
+	// Note in the reply when the deleted session was the active one (the
+	// backend switches the peer to default before removing it).
+	wasActive := false
+	if list, err := h.backend.ListSessions(peerID); err == nil {
+		for _, line := range strings.Split(list, "\n") {
+			fields := strings.Fields(line)
+			if strings.HasPrefix(line, "▶ ") && len(fields) >= 2 && fields[1] == alias {
+				wasActive = true
+				break
+			}
+		}
+	}
+	h.cancelActiveRequest(peerID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.backend.DeleteSession(ctx, peerID, alias); err != nil {
+		if h.log != nil {
+			h.log.WarnLogf("/del for peer %d: %v", peerID, err)
+		}
+		return fmt.Sprintf("❌ Не удалось удалить сессию: %v", err)
+	}
+	reply := fmt.Sprintf("Сессия %s удалена.", alias)
+	if wasActive {
+		reply += "\nЭто была активная сессия — переключено на default."
+	}
+	return reply
+}
+
+// handleSessions implements /sessions: lists the peer's saved sessions.
+func (h *BotHandler) handleSessions(peerID int64) string {
+	list, err := h.backend.ListSessions(peerID)
+	if err != nil {
+		if h.log != nil {
+			h.log.WarnLogf("/sessions for peer %d: %v", peerID, err)
+		}
+		return fmt.Sprintf("❌ Не удалось получить список сессий: %v", err)
+	}
+	return list
 }
 
 func (h *BotHandler) handleStatus(peerID int64) string {

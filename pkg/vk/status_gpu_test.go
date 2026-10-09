@@ -11,6 +11,7 @@ import (
 
 // statusTestBackend is a minimal AgentBackend for /status tests.
 type statusTestBackend struct {
+	namedSessionsStub
 	status string
 	err    error
 }
@@ -19,7 +20,6 @@ func (b *statusTestBackend) EnsureSession(peerID int64) {}
 func (b *statusTestBackend) ProcessMessage(ctx context.Context, message string, peerID int64) (string, error) {
 	return "", nil
 }
-func (b *statusTestBackend) NewSession(ctx context.Context, peerID int64) error { return nil }
 func (b *statusTestBackend) ResetSession(ctx context.Context, peerID int64, workdir string) error {
 	return nil
 }
