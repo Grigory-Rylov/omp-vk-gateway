@@ -128,6 +128,7 @@ func (s *peerSession) startProcessLocked() {
 	}
 	b := s.bridge
 	proc := newProcess(s.peerID, b.log)
+	proc.vkToken = b.vkTokenValue()
 	s.proc = proc
 	if s.resetRequested {
 		// Pending reset: this spawn is the fresh start — scrub session

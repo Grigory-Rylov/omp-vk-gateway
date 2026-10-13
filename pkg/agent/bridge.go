@@ -57,6 +57,7 @@ type Bridge struct {
 	reRunResult    func(peerID int64, text string) error
 	readyTimeout   time.Duration
 	subagentLevel  string // subagent mirroring: off | progress | events
+	vkToken        string // bot token injected into agents as VK_TOKEN (see spawn)
 }
 
 // NewBridge creates the bridge. agentCmd is the full command line of the
@@ -71,6 +72,22 @@ func NewBridge(agentCmd []string, extraArgs []string, log *logger.Logger) *Bridg
 		log:          log,
 		readyTimeout: 60 * time.Second,
 	}
+}
+
+// SetVkToken sets the bot token handed to every spawned agent as VK_TOKEN
+// (with VK_PEER_ID of the agent's chat and VK_GROUP_ID=0 for auto-resolve).
+// mcp-vk-files inherits these through omp, so each gateway's agents send
+// files to their own bot's current chat instead of a shared default.
+func (b *Bridge) SetVkToken(token string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.vkToken = token
+}
+
+func (b *Bridge) vkTokenValue() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.vkToken
 }
 
 // SetStateDir points the bridge at a directory where session state files
@@ -912,8 +929,9 @@ func (b *Bridge) request(s *peerSession, proc *process, ctx context.Context,
 
 // process is one omp --mode rpc subprocess.
 type process struct {
-	peerID int64
-	log    *logger.Logger
+	peerID  int64
+	vkToken string // VK bot token of the owning gateway; empty = inherit env
+	log     *logger.Logger
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
@@ -1021,6 +1039,13 @@ func (p *process) spawn(workdir, resume string, agentCmd, extraArgs []string) er
 
 	cmd := exec.Command(agentCmd[0], args...)
 	cmd.Dir = workdir
+	if p.vkToken != "" {
+		cmd.Env = append(os.Environ(),
+			"VK_TOKEN="+p.vkToken,
+			fmt.Sprintf("VK_PEER_ID=%d", p.peerID),
+			"VK_GROUP_ID=0", // resolve the community from the token itself
+		)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

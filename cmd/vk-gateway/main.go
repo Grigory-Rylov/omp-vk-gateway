@@ -121,6 +121,7 @@ func main() {
 	vkClient := vk.NewBotClient(cfg.TokenVK)
 	backend := agent.NewBridge(cfg.AgentCmd, extraArgs, log)
 	backend.SetSubagentSubscription(cfg.SubagentSubscription)
+	backend.SetVkToken(cfg.TokenVK)
 	// Persist per-peer coprocess state (session id/file, in-flight run_agent
 	// descriptors) so a gateway restart or host reboot resumes the same
 	// oh-my-pi session (via --resume) and re-issues interrupted @agent work.
