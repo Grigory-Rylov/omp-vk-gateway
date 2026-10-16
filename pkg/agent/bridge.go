@@ -493,6 +493,12 @@ func (b *Bridge) RunAgent(ctx context.Context, agent, task string, peerID int64)
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
+	s.mu.Lock()
+	pendingRespawn := s.resetRequested || s.switchRequested
+	s.mu.Unlock()
+	if pendingRespawn {
+		return fmt.Errorf("агент-процесс перезапускается после сброса сессии — отправьте сообщение ещё раз")
+	}
 	return fmt.Errorf("агент-процесс недоступен")
 }
 
@@ -651,6 +657,12 @@ func (b *Bridge) ProcessMessage(ctx context.Context, message string, peerID int6
 		}
 	}
 	if proc == nil {
+		s.mu.Lock()
+		pending := s.resetRequested || s.switchRequested
+		s.mu.Unlock()
+		if pending {
+			return "", fmt.Errorf("агент-процесс перезапускается после сброса сессии — отправьте сообщение ещё раз")
+		}
 		return "", fmt.Errorf("агент-процесс недоступен")
 	}
 	if err := b.prompt(s, proc, message); err != nil {
@@ -951,18 +963,22 @@ type process struct {
 	events  chan []byte // raw JSON lines for non-response frames (incl. chunks, handled by pump)
 
 	exitedCh chan struct{}
+	// spawnedCh closes when the initial spawn settles: cmd recorded (or
+	// spawn failed) — kill() must not act on a half-spawned process.
+	spawnedCh chan struct{}
 
 	idCounter atomic.Uint64
 }
 
 func newProcess(peerID int64, log *logger.Logger) *process {
 	return &process{
-		peerID:   peerID,
-		log:      log,
-		readyCh:  make(chan struct{}),
-		pending:  make(map[string]chan rpcResponse),
-		events:   make(chan []byte, 1024),
-		exitedCh: make(chan struct{}),
+		peerID:    peerID,
+		log:       log,
+		readyCh:   make(chan struct{}),
+		pending:   make(map[string]chan rpcResponse),
+		events:    make(chan []byte, 1024),
+		exitedCh:  make(chan struct{}),
+		spawnedCh: make(chan struct{}),
 	}
 }
 
@@ -1035,6 +1051,9 @@ func (p *process) dropPending(id string) {
 // spawn starts the omp subprocess and blocks (in a background goroutine)
 // until the ready frame + protocol v2 negotiation complete.
 func (p *process) spawn(workdir, resume string, agentCmd, extraArgs []string) error {
+	// spawn always returns: Start either fails or succeeds and launches the
+	// reader goroutines — so spawnedCh always closes.
+	defer close(p.spawnedCh)
 	args := spawnArgs(agentCmd, extraArgs, resume, workdir)
 
 	cmd := exec.Command(agentCmd[0], args...)

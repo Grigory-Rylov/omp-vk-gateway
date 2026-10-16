@@ -23,6 +23,15 @@ func (p *process) failReady(err error) {
 
 // kill terminates the process: SIGTERM, 5s grace, SIGKILL.
 func (p *process) kill() {
+	// A kill issued while the first spawn is still in flight would find
+	// p.cmd nil and silently no-op — losing the reset forever, since
+	// supervise only respawns on process exit. Wait for the spawn attempt
+	// to settle: spawnedCh closes when spawn returns, exitedCh when the
+	// failed process was marked done by the spawner.
+	select {
+	case <-p.spawnedCh:
+	case <-p.exitedCh:
+	}
 	p.mu.Lock()
 	cmd := p.cmd
 	already := p.doneFlag
