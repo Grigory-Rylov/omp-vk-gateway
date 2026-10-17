@@ -33,7 +33,7 @@ func GetAttachmentDownloadURL(attachment map[string]interface{}, vkClient *BotCl
 	case "video":
 		return extractVideoURL(attData, vkClient)
 	case "doc":
-		return extractDocURL(attData)
+		return extractDocURL(attData, vkClient)
 	case "audio_message":
 		return extractAudioMessageURL(attData)
 	case "audio":
@@ -161,8 +161,8 @@ func extractAPIVideoURL(attData map[string]interface{}, vkClient *BotClient) (st
 		logger.DebugToFile("[extractVideoURL] no owner_id/id for API fallback")
 		return "", "", false
 	}
-	logger.DebugToFile("[extractVideoURL] trying videos.get: owner_id=%d video_id=%d", ownerID, videoID)
-	url, err := vkClient.GetBestVideoURL(ownerID, videoID)
+	logger.DebugToFile("[extractVideoURL] trying videos.get: owner_id=%d video_id=%d access_key=%v", ownerID, videoID, attData["access_key"] != nil)
+	url, err := vkClient.GetBestVideoURL(ownerID, videoID, strOrEmpty(attData["access_key"]))
 	if err != nil {
 		logger.DebugToFile("[extractVideoURL] videos.get failed: %v", err)
 		return "", "", false
@@ -238,8 +238,12 @@ func getMapKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-func extractDocURL(attData map[string]interface{}) (string, string, bool) {
-	url, _ := attData["url"].(string)
+// extractDocURL resolves a downloadable URL for a doc attachment.
+// Long-poll payloads for user docs carry response_type "min": the url
+// field points at an HTML preview page behind a login wall, not the file.
+// Prefer the direct CDN url from docs.getById (group token, then user
+// token with the attachment access_key); fall back to the payload url.
+func extractDocURL(attData map[string]interface{}, vkClient *BotClient) (string, string, bool) {
 	title, _ := attData["title"].(string)
 	id, _ := attData["id"].(float64)
 
@@ -248,6 +252,16 @@ func extractDocURL(attData map[string]interface{}) (string, string, bool) {
 		filename = fmt.Sprintf("doc_%.0f", id)
 	}
 
+	if vkClient != nil && id > 0 {
+		ownerID := toInt64(attData["owner_id"])
+		accessKey := strOrEmpty(attData["access_key"])
+		if direct, err := vkClient.GetDocURL(ownerID, int64(id), accessKey); err == nil && direct != "" {
+			logger.DebugToFile("[extractDocURL] docs.getById resolved direct url for %s", filename)
+			return direct, filename, true
+		}
+	}
+
+	url, _ := attData["url"].(string)
 	return url, filename, url != ""
 }
 
@@ -372,6 +386,13 @@ func downloadSingle(urlStr, destPath string) (DownloadedAttachment, error) {
 		return DownloadedAttachment{}, fmt.Errorf("read body: %w", err)
 	}
 
+	// VK serves an HTML login/preview wall when the payload url is stale
+	// or the token lacks access; never save it as if it were the file.
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/html") && !strings.HasSuffix(destPath, ".html") && !strings.HasSuffix(destPath, ".txt") {
+		return DownloadedAttachment{}, fmt.Errorf("got HTML (%d bytes) instead of file — VK preview wall, need docs.getById/user token", len(data))
+	}
+
 	if err := os.WriteFile(destPath, data, 0644); err != nil {
 		return DownloadedAttachment{}, fmt.Errorf("write file: %w", err)
 	}
@@ -393,6 +414,11 @@ func splitFileName(filename string) (string, string) {
 func sanitizeFilename(name string) string {
 	re := regexp.MustCompile(`[^a-zA-Z0-9._\-]`)
 	return re.ReplaceAllString(name, "_")
+}
+
+func strOrEmpty(v interface{}) string {
+	s, _ := v.(string)
+	return s
 }
 
 func FormatAttachmentInfo(downloaded []DownloadedAttachment) string {

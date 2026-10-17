@@ -27,6 +27,7 @@ import (
 // config is the gateway configuration (config.json).
 type config struct {
 	TokenVK              string   `json:"token_vk"`
+	TokenVKUser          string   `json:"token_vk_user"`
 	PeerID               int64    `json:"peer_id"`
 	ThinkingPeerID       int64    `json:"thinking_peer_id"`
 	Workdir              string   `json:"workdir"`
@@ -119,6 +120,10 @@ func main() {
 	log.InfoLogf("Agent command: %v %v", cfg.AgentCmd, extraArgs)
 
 	vkClient := vk.NewBotClient(cfg.TokenVK)
+	if cfg.TokenVKUser != "" {
+		vkClient.SetUserToken(cfg.TokenVKUser)
+		log.InfoLogf("User token configured: private videos.get enabled")
+	}
 	backend := agent.NewBridge(cfg.AgentCmd, extraArgs, log)
 	backend.SetSubagentSubscription(cfg.SubagentSubscription)
 	backend.SetVkToken(cfg.TokenVK)
@@ -189,18 +194,24 @@ func main() {
 		cancel()
 	}()
 
+	// Restart survival: respawn persisted peers with --resume <sessionFile>
+	// and re-issue run_agent work that was in flight when the gateway died.
+	backend.ResumePeers()
+
 	if cfg.PeerID > 0 {
+		// The peer's active session may run in a directory the user picked
+		// with /new or /cd; the banner must show that, not the gateway default.
+		wd := backend.WorkingDir(cfg.PeerID)
+		if wd == "" {
+			wd = workdir
+		}
 		startMsg := fmt.Sprintf("🤖 VK Gateway v%s (build %s, oh-my-pi) запущен.\n"+
 			"Рабочая директория: %s\n"+
-			"Напишите /help для списка команд.", Version, buildinfo.HumanReadable(), workdir)
+			"Напишите /help для списка команд.", Version, buildinfo.HumanReadable(), wd)
 		if _, err := vkClient.SendMessageWithKeyboard(cfg.PeerID, startMsg, vk.CreateCommandKeyboard()); err != nil {
 			log.WarnLogf("Failed to send startup message: %v", err)
 		}
 	}
-
-	// Restart survival: respawn persisted peers with --resume <sessionFile>
-	// and re-issue run_agent work that was in flight when the gateway died.
-	backend.ResumePeers()
 
 	log.InfoLog("Starting VK Bot Handler...")
 	if err := handler.Start(ctx); err != nil {

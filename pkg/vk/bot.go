@@ -81,11 +81,16 @@ type APIErrorResponse struct {
 
 type BotClient struct {
 	token      string
+	userToken  string
 	apiVersion string
 	baseURL    string
 	httpClient *http.Client
 	groupID    int64
 }
+
+// SetUserToken enables user-token fallback for methods the group service
+// token cannot call (videos.* returns VK error 3 for service tokens).
+func (c *BotClient) SetUserToken(t string) { c.userToken = t }
 
 func NewBotClient(token string) *BotClient {
 	c := &BotClient{
@@ -253,9 +258,13 @@ func (c *BotClient) doRequestPOST(endpoint string, params map[string]interface{}
 }
 
 func (c *BotClient) doRequestGET(endpoint string, params map[string]interface{}) ([]byte, error) {
+	return c.doRequestGETToken(endpoint, params, c.token)
+}
+
+func (c *BotClient) doRequestGETToken(endpoint string, params map[string]interface{}, token string) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s%s", c.baseURL, endpoint)
 
-	query := "access_token=" + c.token + "&v=" + c.apiVersion
+	query := "access_token=" + token + "&v=" + c.apiVersion
 
 	for k, v := range params {
 		if k == "access_token" || k == "v" {
@@ -669,12 +678,30 @@ func truncateForLog(data []byte, max int) string {
 	return string(data[:max]) + "..."
 }
 
-func (c *BotClient) GetBestVideoURL(ownerID, videoID int64) (string, error) {
+// GetBestVideoURL resolves a playable mp4 for a video attachment.
+// The group service token cannot call videos.* at all (VK answers error 3
+// "Unknown method passed"), and private videos additionally require the
+// attachment access_key, so: try the group token first, then fall back to
+// the configured user token (token_vk_user) with access_key.
+func (c *BotClient) GetBestVideoURL(ownerID, videoID int64, accessKey string) (string, error) {
 	params := map[string]interface{}{
 		"owner_id": ownerID,
 		"video_id": videoID,
 	}
-	responseBody, err := c.doRequestGET("videos.get", params)
+	if accessKey != "" {
+		params["access_key"] = accessKey
+	}
+
+	url, err := c.videosGetURL(params, c.token)
+	if url != "" || err == nil || c.userToken == "" {
+		return url, err
+	}
+	logger.DebugToFile("[GetBestVideoURL] group token failed (%v), retrying with user token", err)
+	return c.videosGetURL(params, c.userToken)
+}
+
+func (c *BotClient) videosGetURL(params map[string]interface{}, token string) (string, error) {
+	responseBody, err := c.doRequestGETToken("videos.get", params, token)
 	if err != nil {
 		return "", fmt.Errorf("videos.get: %w", err)
 	}
@@ -691,6 +718,57 @@ func (c *BotClient) GetBestVideoURL(ownerID, videoID int64) (string, error) {
 		return "", nil
 	}
 	return findBestMp4(response.Response[0].Files), nil
+}
+
+// GetDocURL resolves the direct CDN url for a doc attachment. The group
+// service token sees an empty list for user docs, so retry with the user
+// token (token_vk_user) passing the attachment access_key.
+func (c *BotClient) GetDocURL(ownerID, docID int64, accessKey string) (string, error) {
+	docs := fmt.Sprintf("%d_%d", ownerID, docID)
+	if accessKey != "" {
+		docs += "," + accessKey
+	}
+	params := map[string]interface{}{"docs": docs}
+
+	url, err := c.docsGetURL(params, c.token)
+	if url != "" || err == nil || c.userToken == "" {
+		return url, err
+	}
+	logger.DebugToFile("[GetDocURL] group token got no url (%v), retrying with user token", err)
+	return c.docsGetURL(params, c.userToken)
+}
+
+func (c *BotClient) docsGetURL(params map[string]interface{}, token string) (string, error) {
+	responseBody, err := c.doRequestGETToken("docs.getById", params, token)
+	if err != nil {
+		return "", fmt.Errorf("docs.getById: %w", err)
+	}
+
+	// response is either a bare list or {"count":N,"items":[...]}
+	var raw struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
+		return "", fmt.Errorf("parse docs.getById response: %w", err)
+	}
+	var items []struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(raw.Response, &items); err != nil {
+		var wrapped struct {
+			Items []struct {
+				URL string `json:"url"`
+			} `json:"items"`
+		}
+		if err2 := json.Unmarshal(raw.Response, &wrapped); err2 != nil {
+			return "", fmt.Errorf("parse docs.getById items: %w", err)
+		}
+		items = wrapped.Items
+	}
+	if len(items) == 0 {
+		return "", nil
+	}
+	return items[0].URL, nil
 }
 
 func (c *BotClient) splitText(text string, maxLength int) []string {
